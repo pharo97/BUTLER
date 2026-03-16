@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<!--
+  BUTLER Pulse Visual — JARVIS Holographic Orb  (True 3D + Independent Chunk Pulsing + Solar Flares)
+  Canvas 2D, no external dependencies.
+  Bridge API: window.butler.setState(state, amplitude)
+  States: idle, listening, thinking, deepThinking, speaking, concerned, alert, success, learning
+-->
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+html, body { width:100%; height:100%; background:#000; overflow:hidden; }
+canvas { display:block; width:100%; height:100%; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+// ─────────────────────────────────────────────────────────────────────────────
+// BUTLER — JARVIS Holographic Orb  (True 3D + Independent Chunk Pulsing + Solar Flares)
+//
+// Every element has its own pulse phase/frequency — rings, fragments, particles,
+// and tendrils all breathe independently creating organic asynchronous motion.
+// Solar flares erupt randomly from the kernel, arcing outward like prominence.
+//
+// Layer 1  Energy Kernel        — amber nucleus, breathing
+// Layer 2  Core Halo Rings      — 4 tilted 3D rings, each pulse independently
+// Layer 3  Tendril Network      — 3D lines, length-pulse + flicker
+// Layer 4  Dynamic Data Ring    — 3D orbital particles, orbit-radius pulse
+// Layer 5  Outer Fragment Shell — 3D arcs, radius pulse on independent axes
+//       +  Solar Flares         — energy bursts from kernel, arcing outward
+//
+// Colors:  #FFB300 · #FFD54F · #FF8F00 · additive blending
+// Bridge:  window.butler.setState(name, amplitude)
+// ─────────────────────────────────────────────────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+let W, H, CX, CY, R;
+function resize() {
+  const dpr = window.devicePixelRatio || 2;
+  W = Math.round(canvas.clientWidth  * dpr);
+  H = Math.round(canvas.clientHeight * dpr);
+  canvas.width = W; canvas.height = H;
+  CX = W * 0.5; CY = H * 0.5;
+  R  = Math.min(W, H) * 0.30;
+}
+window.addEventListener('resize', resize);
+resize();
+// ── Colour ────────────────────────────────────────────────────────────────────
+const CP = [255, 179,   0];   // #FFB300 primary
+const CH = [255, 213,  79];   // #FFD54F highlight
+const CG = [255, 143,   0];   // #FF8F00 glow
+const CW = [255, 255, 255];
+function rgba(c, a) {
+  return `rgba(${c[0]|0},${c[1]|0},${c[2]|0},${Math.max(0,Math.min(1,a)).toFixed(3)})`;
+}
+// ── Seeded RNG (geometry init only) ──────────────────────────────────────────
+let _s = 0xdeadbeef;
+const rng = () => { _s ^= _s<<13; _s ^= _s>>17; _s ^= _s<<5; return (_s>>>0)/4294967296; };
+// ── 3D math ───────────────────────────────────────────────────────────────────
+const dot3   = (a,b) => a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+const cross3 = (a,b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+const nrm3   = v     => { const l=Math.hypot(v[0],v[1],v[2]); return [v[0]/l,v[1]/l,v[2]/l]; };
+const scl3   = (v,s) => [v[0]*s, v[1]*s, v[2]*s];
+const add3   = (a,b) => [a[0]+b[0], a[1]+b[1], a[2]+b[2]];
+function rodrigues(v, k, th) {
+  const c=Math.cos(th), s=Math.sin(th), d=dot3(k,v), cr=cross3(k,v);
+  return [v[0]*c+cr[0]*s+k[0]*d*(1-c),
+          v[1]*c+cr[1]*s+k[1]*d*(1-c),
+          v[2]*c+cr[2]*s+k[2]*d*(1-c)];
+}
+function basis(axis) {
+  let u = Math.abs(axis[0]) < 0.8 ? [1,0,0] : [0,1,0];
+  const d = dot3(u, axis);
+  u = nrm3([u[0]-d*axis[0], u[1]-d*axis[1], u[2]-d*axis[2]]);
+  return { u, v: cross3(axis, u) };
+}
+// ── Camera + perspective ──────────────────────────────────────────────────────
+let camY = 0;
+const FOCAL = 3.8;
+function camXform(p, cx) {
+  const cy=Math.cos(camY), sy=Math.sin(camY);
+  const x1=cy*p[0]+sy*p[2], z1=-sy*p[0]+cy*p[2];
+  const ccx=Math.cos(cx), scx=Math.sin(cx);
+  return [x1, ccx*p[1]-scx*z1, scx*p[1]+ccx*z1];
+}
+function proj(p, cx) {
+  const c=camXform(p, cx), d=Math.max(0.25, FOCAL-c[2]), s=FOCAL/d;
+  return { sx:CX+c[0]*R*s, sy:CY-c[1]*R*s, sc:s };
+}
+const dA = sc => Math.max(0.04, Math.min(1.45, (sc-0.50)*1.70));
+// ── State / bridge ────────────────────────────────────────────────────────────
+let tS=0, cS=0, tA=0, cA=0;
+let tNB=0, cNB=0, tLB=0, cLB=0;
+window.butler = {
+  setState(name, amp) {
+    const orbMap = {idle:0, listening:1, thinking:2, deepThinking:2, speaking:3, concerned:2, alert:3, success:1, learning:2};
+    const neuralMap = {idle:0, listening:0, thinking:0.45, deepThinking:1.0, speaking:0, concerned:0, alert:0, success:0, learning:0.65};
+    const learnMap  = {idle:0, listening:0, thinking:0,    deepThinking:0,   speaking:0, concerned:0, alert:0, success:0, learning:1.0};
+    tS  = orbMap[name]    !== undefined ? orbMap[name]    : 0;
+    tNB = neuralMap[name] !== undefined ? neuralMap[name] : 0;
+    tLB = learnMap[name]  !== undefined ? learnMap[name]  : 0;
+    tA  = Math.max(0, Math.min(1, +amp || 0));
+  },
+  setBirthMode() {}
+};
+// kernelBreath | tendrilExt | partSpeed | fragRotMult | ringGlow | pulseRate | spinSpeed | flareRate | chunkPulseAmt
+const SP = [
+  [0.040, 0.88, 1.00, 1.0, 0.30, 0.40, 0.28, 0.50, 0.06],  // idle
+  [0.075, 1.12, 1.75, 1.2, 0.52, 1.30, 0.44, 1.20, 0.09],  // listening
+  [0.062, 0.96, 2.50, 1.6, 0.47, 2.90, 0.62, 2.00, 0.12],  // thinking
+  [0.110, 1.32, 3.10, 1.9, 0.68, 4.60, 0.50, 3.50, 0.15],  // speaking
+];
+function spv(i) {
+  const s=Math.max(0,Math.min(2.9999,cS)), ii=s|0, f=s-ii;
+  return SP[ii][i]+(SP[Math.min(3,ii+1)][i]-SP[ii][i])*f;
+}
+// ── Layer 2: Core Halo Rings ──────────────────────────────────────────────────
+const HALO_NORMALS = [
+  nrm3([ 0.05, 1.00,  0.08]),
+  nrm3([ 0.95, 0.18,  0.35]),
+  nrm3([-0.50, 0.65,  0.55]),
+  nrm3([ 0.12, 0.28,  0.95]),
+];
+const halos = HALO_NORMALS.map((normal, i) => {
+  const {u, v} = basis(normal);
+  return {
+    normal, u, v,
+    baseRadius:  0.44 + i * 0.09,
+    rotAngle:    rng() * Math.PI * 2,
+    rotPeriod:   (i%2===0 ? 1:-1) * (38 + i*9),
+    pPhase: rng() * Math.PI * 2,
+    pFreq:  0.55 + rng() * 0.90,
+    segments: Array.from({length:4+i*2}, () => ({
+      startFrac: rng(),
+      arc:       0.10 + rng() * 0.22,
+      width:     0.55 + rng() * 0.90,
+      alpha:     0.22 + rng() * 0.42,
+      wPhase:    rng() * Math.PI * 2,
+      sPPhase:   rng() * Math.PI * 2,
+      sPFreq:    0.8  + rng() * 1.2,
+    })),
+  };
+});
+// ── Layer 3: Tendril Network ──────────────────────────────────────────────────
+const N_TEND = 22;
+const GA = Math.PI * (3 - Math.sqrt(5));
+const tendrils = Array.from({length:N_TEND}, (_,i) => {
+  const y3=1-(i/(N_TEND-1))*2, r2=Math.sqrt(Math.max(0,1-y3*y3)), phi3=i*GA;
+  const d3=[r2*Math.cos(phi3), y3, r2*Math.sin(phi3)];
+  const {u:p1, v:p2} = basis(d3);
+  const nSegs = 3 + Math.floor(rng()*5);
+  const waypts = Array.from({length:nSegs-1}, (_,w) => ({
+    frac:(w+1)/nSegs, j1:(rng()-0.5)*0.13, j2:(rng()-0.5)*0.13,
+  }));
+  const hasBranch = rng() > 0.52;
+  const bTheta = rng()*Math.PI*2, bBlend = 0.55+rng()*0.45;
+  const bD3 = hasBranch
+    ? nrm3(add3(d3, scl3(add3(scl3(p1,Math.cos(bTheta)), scl3(p2,Math.sin(bTheta))), bBlend)))
+    : d3;
+  return {
+    d3, p1, p2,
+    baseLength:  0.50 + rng() * 0.50,
+    width:       1.0  + rng() * 1.0,
+    alpha:       0.20 + rng() * 0.80,
+    phase:       rng() * Math.PI * 2,
+    flickerRate: 0.7  + rng() * 2.0,
+    jagged:      rng() > 0.38,
+    waypts,
+    pulsePhase:  rng() * Math.PI * 2,
+    pulseSpeed:  1.2  + rng() * 2.8,
+    pPhase:      rng() * Math.PI * 2,
+    pFreq:       0.50 + rng() * 1.10,
+    hasBranch, bD3,
+    branchLen:   0.16 + rng() * 0.30,
+  };
+});
+// ── Layer 4: Dynamic Data Ring ────────────────────────────────────────────────
+const N_PART = 30;
+const parts = Array.from({length:N_PART}, () => {
+  const th=rng()*Math.PI, ph=rng()*Math.PI*2;
+  const orbAxis = nrm3([Math.sin(th)*Math.cos(ph), Math.cos(th), Math.sin(th)*Math.sin(ph)]);
+  const {u,v} = basis(orbAxis);
+  const type = rng()>0.55?'dot':rng()>0.5?'arc':'spark';
+  return {
+    u, v,
+    baseOrbitR: 0.82 + rng() * 0.70,
+    period:     10   + rng() * 30,
+    dir:        rng()>0.5?1:-1,
+    phase:      rng() * Math.PI * 2,
+    type, size: 1.8+rng()*2.2, alpha: 0.40+rng()*0.60, arcLen: 0.08+rng()*0.35,
+    pPhase:     rng() * Math.PI * 2,
+    pFreq:      0.45 + rng() * 0.95,
+  };
+});
+const flashes=[]; let flashAcc=0;
+function spawnFlash() {
+  if(flashes.length>=8) return;
+  const i=Math.floor(Math.random()*N_PART);
+  const j=(i+1+Math.floor(Math.random()*(N_PART-1)))%N_PART;
+  flashes.push({i,j,t:0,dur:0.28+Math.random()*0.48});
+}
+// ── Layer 5: Outer Fragment Shell ─────────────────────────────────────────────
+const N_FRAG = 14;
+const frags = Array.from({length:N_FRAG}, () => {
+  const th=rng()*Math.PI, ph=rng()*Math.PI*2;
+  const axis=nrm3([Math.sin(th)*Math.cos(ph), Math.cos(th), Math.sin(th)*Math.sin(ph)]);
+  const {u,v}=basis(axis);
+  return {
+    axis,u,v,
+    baseRadius:  0.92 + rng() * 0.40,
+    arcStart:    rng() * Math.PI * 2,
+    arcLen:      0.28 + rng() * 0.88,
+    thickness:   2.0  + rng() * 2.0,
+    baseAlpha:   0.28 + rng() * 0.52,
+    rotPeriod:   (60  + rng()*60)*(rng()>0.5?1:-1),
+    rotAngle:    rng() * Math.PI * 2,
+    pPhase:      rng() * Math.PI * 2,
+    pFreq:       0.35 + rng() * 0.80,
+    phase:       rng() * Math.PI * 2,
+  };
+});
+// ── Solar Flares ──────────────────────────────────────────────────────────────
+const sFlares = [];
+let flareAcc = 0;
+function spawnFlare(kR) {
+  if(sFlares.length >= 7) return;
+  const big     = Math.random() > 0.65;
+  const angle   = Math.random() * Math.PI * 2;
+  const len     = big ? (0.38 + Math.random()*0.38) : (0.10 + Math.random()*0.18);
+  const curve   = (Math.random()-0.5) * (big ? 0.60 : 0.40);
+  const width   = big ? (4.5 + Math.random()*6.0) : (1.5 + Math.random()*3.0);
+  const dur     = big ? (0.65 + Math.random()*0.65) : (0.22 + Math.random()*0.32);
+  const hasBranch = big && Math.random() > 0.45;
+  sFlares.push({
+    angle, lenR: len, curve, width, dur, t:0, big, kR,
+    hasBranch,
+    branchAngle:  angle + (Math.random()-0.5)*0.9,
+    branchLenR:   0.12 + Math.random()*0.18,
+    branchCurve:  (Math.random()-0.5)*0.5,
+    branchAt:     0.40 + Math.random()*0.30,
+  });
+}
+function drawFlare(fl) {
+  const progress = fl.t / fl.dur;
+  const extFrac  = Math.min(1, progress / 0.35);
+  const alpha    = extFrac * Math.pow(1 - progress, 0.65);
+  if(alpha < 0.012) return;
+  const tipLen  = fl.lenR * R * extFrac;
+  const ang     = fl.angle;
+  const perpX   = -Math.sin(ang), perpY = Math.cos(ang);
+  const cosA    = Math.cos(ang),  sinA  = Math.sin(ang);
+  const sx = CX + cosA * fl.kR;
+  const sy = CY + sinA * fl.kR;
+  const ex = CX + cosA * (fl.kR + tipLen);
+  const ey = CY + sinA * (fl.kR + tipLen);
+  const mid = fl.kR + tipLen * 0.5;
+  const cx2 = CX + cosA * mid + perpX * tipLen * fl.curve;
+  const cy2 = CY + sinA * mid + perpY * tipLen * fl.curve;
+  ctx.lineCap = 'round';
+  const w = fl.width * (R/200);
+  const gOut = ctx.createLinearGradient(sx,sy,ex,ey);
+  gOut.addColorStop(0, rgba(CG, alpha*0.55));
+  gOut.addColorStop(0.5,rgba(CP, alpha*0.35));
+  gOut.addColorStop(1, rgba(CP, 0));
+  ctx.beginPath(); ctx.moveTo(sx,sy); ctx.quadraticCurveTo(cx2,cy2,ex,ey);
+  ctx.strokeStyle=gOut; ctx.lineWidth=w*5.5; ctx.stroke();
+  const gMid = ctx.createLinearGradient(sx,sy,ex,ey);
+  gMid.addColorStop(0, rgba(CH, alpha*0.88));
+  gMid.addColorStop(0.4,rgba(CP, alpha*0.65));
+  gMid.addColorStop(1, rgba(CP, 0));
+  ctx.beginPath(); ctx.moveTo(sx,sy); ctx.quadraticCurveTo(cx2,cy2,ex,ey);
+  ctx.strokeStyle=gMid; ctx.lineWidth=w*1.6; ctx.stroke();
+  const gCore = ctx.createLinearGradient(sx,sy,ex,ey);
+  gCore.addColorStop(0,   rgba(CW, alpha*0.98));
+  gCore.addColorStop(0.25,rgba(CH, alpha*0.80));
+  gCore.addColorStop(0.7, rgba(CP, alpha*0.40));
+  gCore.addColorStop(1,   rgba(CP, 0));
+  ctx.beginPath(); ctx.moveTo(sx,sy); ctx.quadraticCurveTo(cx2,cy2,ex,ey);
+  ctx.strokeStyle=gCore; ctx.lineWidth=w*0.38; ctx.stroke();
+  const tipGlow = ctx.createRadialGradient(ex,ey,0, ex,ey, w*4.5);
+  tipGlow.addColorStop(0, rgba(CW, alpha*0.70));
+  tipGlow.addColorStop(0.4,rgba(CH, alpha*0.40));
+  tipGlow.addColorStop(1, rgba(CP, 0));
+  ctx.fillStyle=tipGlow; ctx.beginPath(); ctx.arc(ex,ey,w*4.5,0,Math.PI*2); ctx.fill();
+  if(fl.hasBranch && extFrac > fl.branchAt) {
+    const bFrac  = Math.min(1, (extFrac - fl.branchAt) / (1 - fl.branchAt));
+    const bAlpha = alpha * bFrac * 0.65;
+    const bLen   = fl.branchLenR * R * bFrac;
+    const bt     = fl.branchAt;
+    const bsx    = sx + (cx2-sx)*2*bt*(1-bt) + (ex-sx)*bt*bt;
+    const bsy    = sy + (cy2-sy)*2*bt*(1-bt) + (ey-sy)*bt*bt;
+    const bcosA  = Math.cos(fl.branchAngle), bsinA = Math.sin(fl.branchAngle);
+    const bperpX = -bsinA, bperpY = bcosA;
+    const bex    = bsx + bcosA*bLen;
+    const bey    = bsy + bsinA*bLen;
+    const bcx    = bsx + bcosA*(bLen*0.5) + bperpX*bLen*fl.branchCurve;
+    const bcy    = bsy + bsinA*(bLen*0.5) + bperpY*bLen*fl.branchCurve;
+    const gbMid  = ctx.createLinearGradient(bsx,bsy,bex,bey);
+    gbMid.addColorStop(0,rgba(CH,bAlpha*0.80)); gbMid.addColorStop(1,rgba(CP,0));
+    ctx.beginPath(); ctx.moveTo(bsx,bsy); ctx.quadraticCurveTo(bcx,bcy,bex,bey);
+    ctx.strokeStyle=gbMid; ctx.lineWidth=w*0.9; ctx.stroke();
+    const gbC = ctx.createLinearGradient(bsx,bsy,bex,bey);
+    gbC.addColorStop(0,rgba(CW,bAlpha*0.90)); gbC.addColorStop(1,rgba(CP,0));
+    ctx.beginPath(); ctx.moveTo(bsx,bsy); ctx.quadraticCurveTo(bcx,bcy,bex,bey);
+    ctx.strokeStyle=gbC; ctx.lineWidth=w*0.18; ctx.stroke();
+  }
+}
+// ── Neural Overlay ────────────────────────────────────────────────────────────
+const N_NEURONS = 64;
+const neurons = Array.from({length: N_NEURONS}, (_, i) => {
+  const y3  = 1 - (i / (N_NEURONS - 1)) * 2;
+  const r2  = Math.sqrt(Math.max(0, 1 - y3 * y3));
+  const phi = i * 2.39996;
+  return {
+    x:    Math.cos(phi) * r2 * 0.50,
+    y:    y3 * 0.50,
+    z:    Math.sin(phi) * r2,
+    sz:   1.3 + ((Math.sin(phi) * r2 + 1) * 0.5) * 1.2,
+    ph:   rng() * Math.PI * 2,
+    freq: 0.30 + rng() * 1.10,
+  };
+});
+const SYN_DIST = 0.24;
+const synapses = [];
+for (let i = 0; i < N_NEURONS; i++) {
+  for (let j = i + 1; j < N_NEURONS; j++) {
+    const dx = neurons[i].x - neurons[j].x, dy = neurons[i].y - neurons[j].y;
+    if (dx*dx + dy*dy < SYN_DIST * SYN_DIST) {
+      synapses.push({ a: i, b: j, ph: rng() * Math.PI * 2, spd: 0.35 + rng() * 0.75 });
+    }
+  }
+}
+function drawNeuralOverlay(t, nb, lb) {
+  if (nb < 0.01) return;
+  const rC = (120 + lb * 135) | 0;
+  const gC = ( 70 + lb * 150) | 0;
+  const bC = (255 - lb * 210) | 0;
+  const nc = (a) => `rgba(${rC},${gC},${bC},${(Math.max(0, a) * nb).toFixed(3)})`;
+  const gc = (a) => `rgba(255,215,50,${(Math.max(0, a) * lb * nb).toFixed(3)})`;
+  for (const s of synapses) {
+    const pulse  = Math.pow(Math.max(0, Math.sin(t * s.spd * Math.PI * 2 + s.ph)), 4);
+    if (pulse < 0.03) continue;
+    const na = neurons[s.a], nb2 = neurons[s.b];
+    const ax = CX + na.x * R, ay = CY - na.y * R;
+    const bx = CX + nb2.x * R, by = CY - nb2.y * R;
+    ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by);
+    ctx.strokeStyle = nc(pulse * 0.65);
+    ctx.lineWidth   = 0.6 * (R / 200); ctx.stroke();
+  }
+  for (const n of neurons) {
+    const fire  = Math.sin(t * n.freq * Math.PI * 2 + n.ph);
+    const hot   = Math.pow(Math.max(0, fire), 3);
+    const nx    = CX + n.x * R, ny = CY - n.y * R;
+    const nr    = n.sz * (R / 200);
+    if (hot > 0.05) {
+      const g = ctx.createRadialGradient(nx, ny, 0, nx, ny, nr * 9);
+      g.addColorStop(0,   nc(hot * 0.85));
+      g.addColorStop(0.3, nc(hot * 0.25));
+      g.addColorStop(1,   nc(0));
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(nx, ny, nr * 9, 0, Math.PI * 2); ctx.fill();
+    }
+    const base = 0.06 + hot * 0.55;
+    const ig   = ctx.createRadialGradient(nx, ny, 0, nx, ny, nr);
+    ig.addColorStop(0, nc(base + 0.15)); ig.addColorStop(1, nc(base * 0.2));
+    ctx.fillStyle = ig;
+    ctx.beginPath(); ctx.arc(nx, ny, nr, 0, Math.PI * 2); ctx.fill();
+  }
+  if (lb > 0.01) {
+    const growPhase  = (t * 0.28) % 1;
+    const growR      = growPhase * R * 0.52;
+    const growAlpha  = Math.sin(growPhase * Math.PI) * 0.55;
+    for (const s of synapses) {
+      const na = neurons[s.a], nb2 = neurons[s.b];
+      const mx  = (na.x + nb2.x) * 0.5, my = (na.y + nb2.y) * 0.5;
+      const mid = Math.sqrt(mx*mx + my*my) * R;
+      if (Math.abs(mid - growR) > R * 0.11) continue;
+      const ax = CX + na.x*R, ay = CY - na.y*R;
+      const bx = CX + nb2.x*R, by = CY - nb2.y*R;
+      ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by);
+      ctx.strokeStyle = gc(growAlpha); ctx.lineWidth = 1.4 * (R / 200); ctx.stroke();
+    }
+  }
+}
+// ── Render loop ────────────────────────────────────────────────────────────────
+let lastT = performance.now();
+function frame(now) {
+  const dt = Math.min((now-lastT)*0.001, 0.05); lastT=now;
+  const lf = 1-Math.pow(0.04,dt);
+  cS+=(tS-cS)*lf; cA+=(tA-cA)*lf;
+  cNB += (tNB - cNB) * lf;
+  cLB += (tLB - cLB) * lf;
+  const t         = now * 0.001;
+  const kBreath   = spv(0);
+  const tendExt   = spv(1);
+  const partSpeed = spv(2);
+  const fragRot   = spv(3);
+  const ringGlow  = spv(4);
+  const pulseRate = spv(5);
+  const spinSpd   = spv(6);
+  const flareRate = spv(7);
+  const chunkAmt  = spv(8);
+  camY += 0.011 * spinSpd * dt;
+  const camX = 0.30 + Math.sin(t*0.13)*0.09 + Math.sin(t*0.057)*0.04;
+  const heartbeat = Math.sin(t * 0.75 * Math.PI * 2);
+  const rawB  = Math.sin(t / 2.5 * Math.PI * 2);
+  const eased = rawB > 0 ? Math.pow(rawB,0.80) : -Math.pow(-rawB,0.80);
+  const kScale = 1.0 + kBreath*(eased*0.5+0.5) + cA*0.06;
+  const kR    = R * 0.12 * kScale;
+  const cpulse = (pPhase, pFreq) =>
+    heartbeat * 0.30 + Math.sin(t * pFreq * Math.PI * 2 + pPhase) * 0.70;
+
+  // ── Draw ──────────────────────────────────────────────────────────────────
+  ctx.clearRect(0,0,W,H);
+  const atm=ctx.createRadialGradient(CX,CY,0,CX,CY,R*2.1);
+  atm.addColorStop(0,   rgba(CG,0.05+cA*0.02));
+  atm.addColorStop(0.5, rgba(CP,0.015));
+  atm.addColorStop(1,   rgba(CP,0));
+  ctx.fillStyle=atm; ctx.fillRect(0,0,W,H);
+  ctx.globalCompositeOperation='lighter';
+
+  // Layer 5 — Outer Fragment Shell
+  for(const fg of frags) {
+    fg.rotAngle += (Math.PI*2/fg.rotPeriod)*dt*fragRot;
+    const ru=rodrigues(fg.u,fg.axis,fg.rotAngle);
+    const rv=rodrigues(fg.v,fg.axis,fg.rotAngle);
+    const cp      = cpulse(fg.pPhase, fg.pFreq);
+    const radMult = 1.0 + cp * chunkAmt * 1.4;
+    const aMult   = 0.82 + cp * 0.18;
+    const r       = fg.baseRadius * radMult;
+    const NP=22; const pts=[];
+    for(let s=0;s<=NP;s++){
+      const th2=fg.arcStart+(s/NP)*fg.arcLen;
+      const p3=scl3([ru[0]*Math.cos(th2)+rv[0]*Math.sin(th2),
+                     ru[1]*Math.cos(th2)+rv[1]*Math.sin(th2),
+                     ru[2]*Math.cos(th2)+rv[2]*Math.sin(th2)], r);
+      pts.push(proj(p3,camX));
+    }
+    const wobA   = 0.72+0.28*Math.sin(t*0.22+fg.phase);
+    const baseA  = fg.baseAlpha*wobA*aMult*(0.55+ringGlow*0.45);
+    const w      = fg.thickness*(R/200);
+    for(let s=0;s<NP;s++){
+      const pa=pts[s],pb=pts[s+1],avgSc=(pa.sc+pb.sc)*0.5;
+      const a=baseA*dA(avgSc); if(a<0.022)continue;
+      const ww=w*avgSc; ctx.lineCap='round';
+      ctx.beginPath();ctx.moveTo(pa.sx,pa.sy);ctx.lineTo(pb.sx,pb.sy);
+      ctx.strokeStyle=rgba(CG,a*0.40);ctx.lineWidth=ww*4.2;ctx.stroke();
+      ctx.beginPath();ctx.moveTo(pa.sx,pa.sy);ctx.lineTo(pb.sx,pb.sy);
+      ctx.strokeStyle=rgba(CP,a*0.82);ctx.lineWidth=ww;ctx.stroke();
+      ctx.beginPath();ctx.moveTo(pa.sx,pa.sy);ctx.lineTo(pb.sx,pb.sy);
+      ctx.strokeStyle=rgba(CH,a*0.50);ctx.lineWidth=ww*0.28;ctx.stroke();
+    }
+  }
+
+  // Layer 4 — Dynamic Data Ring
+  flashAcc+=pulseRate*dt;
+  while(flashAcc>=1){flashAcc--;spawnFlash();}
+  for(let i=flashes.length-1;i>=0;i--){
+    flashes[i].t+=dt/flashes[i].dur; if(flashes[i].t>=1)flashes.splice(i,1);
+  }
+  const pPos=parts.map(p=>{
+    const cp      = cpulse(p.pPhase, p.pFreq);
+    const orbitR  = p.baseOrbitR * (1.0 + cp * chunkAmt * 0.8);
+    const angle   = (Math.PI*2/p.period)*p.dir*t*partSpeed + p.phase;
+    const c3=Math.cos(angle), s3=Math.sin(angle);
+    const p3=scl3([p.u[0]*c3+p.v[0]*s3, p.u[1]*c3+p.v[1]*s3, p.u[2]*c3+p.v[2]*s3], orbitR);
+    const pr=proj(p3,camX);
+    const c4=Math.cos(angle+0.06),s4=Math.sin(angle+0.06);
+    const p4=scl3([p.u[0]*c4+p.v[0]*s4,p.u[1]*c4+p.v[1]*s4,p.u[2]*c4+p.v[2]*s4],orbitR);
+    const pr2=proj(p4,camX);
+    return{...pr, screenAngle:Math.atan2(pr2.sy-pr.sy,pr2.sx-pr.sx)};
+  });
+  for(const fl of flashes){
+    const pa=pPos[fl.i],pb=pPos[fl.j],prog=Math.sin(fl.t*Math.PI);
+    ctx.beginPath();ctx.moveTo(pa.sx,pa.sy);ctx.lineTo(pb.sx,pb.sy);
+    ctx.strokeStyle=rgba(CH,0.52*prog);ctx.lineWidth=0.9*(R/200);ctx.lineCap='round';ctx.stroke();
+    for(const pp of [pa,pb]){
+      const gr=ctx.createRadialGradient(pp.sx,pp.sy,0,pp.sx,pp.sy,3.5*(R/200)*pp.sc);
+      gr.addColorStop(0,rgba(CW,0.80*prog));gr.addColorStop(1,rgba(CH,0));
+      ctx.fillStyle=gr;ctx.beginPath();ctx.arc(pp.sx,pp.sy,3.5*(R/200)*pp.sc,0,Math.PI*2);ctx.fill();
+    }
+  }
+  for(let i=0;i<N_PART;i++){
+    const p=parts[i],pp=pPos[i];
+    const a=p.alpha*dA(pp.sc)*(0.65+ringGlow*0.35); if(a<0.04)continue;
+    const r=p.size*(R/200)*pp.sc;
+    if(p.type==='dot'){
+      const og=ctx.createRadialGradient(pp.sx,pp.sy,0,pp.sx,pp.sy,r*4.2);
+      og.addColorStop(0,rgba(CP,a*0.72));og.addColorStop(0.4,rgba(CG,a*0.35));og.addColorStop(1,rgba(CG,0));
+      ctx.fillStyle=og;ctx.beginPath();ctx.arc(pp.sx,pp.sy,r*4.2,0,Math.PI*2);ctx.fill();
+      const ig=ctx.createRadialGradient(pp.sx,pp.sy,0,pp.sx,pp.sy,r);
+      ig.addColorStop(0,rgba(CW,a*0.95));ig.addColorStop(0.5,rgba(CH,a*0.80));ig.addColorStop(1,rgba(CP,0));
+      ctx.fillStyle=ig;ctx.beginPath();ctx.arc(pp.sx,pp.sy,r,0,Math.PI*2);ctx.fill();
+    } else if(p.type==='arc'){
+      const arcA=pp.screenAngle+Math.PI*0.5;
+      ctx.beginPath();ctx.arc(pp.sx,pp.sy,r*2.8,arcA,arcA+p.arcLen*Math.PI*1.5);
+      ctx.strokeStyle=rgba(CP,a*0.78);ctx.lineWidth=1.1*(R/200)*pp.sc;ctx.lineCap='round';ctx.stroke();
+      ctx.strokeStyle=rgba(CH,a*0.42);ctx.lineWidth=0.34*(R/200)*pp.sc;ctx.stroke();
+    } else {
+      const sparkLen=r*4.8, sx2=Math.cos(pp.screenAngle), sy2=Math.sin(pp.screenAngle);
+      const sg=ctx.createLinearGradient(pp.sx-sx2*sparkLen,pp.sy-sy2*sparkLen,pp.sx+sx2*sparkLen,pp.sy+sy2*sparkLen);
+      sg.addColorStop(0,rgba(CG,0));sg.addColorStop(0.5,rgba(CW,a*0.88));sg.addColorStop(1,rgba(CG,0));
+      ctx.beginPath();ctx.moveTo(pp.sx-sx2*sparkLen,pp.sy-sy2*sparkLen);ctx.lineTo(pp.sx+sx2*sparkLen,pp.sy+sy2*sparkLen);
+      ctx.strokeStyle=sg;ctx.lineWidth=1.2*(R/200)*pp.sc;ctx.lineCap='round';ctx.stroke();
+    }
+  }
+
+  // Layer 3 — Tendril Network
+  for(const td of tendrils){
+    const flicker  = 0.50+0.50*Math.sin(t*td.flickerRate+td.phase);
+    const cp       = cpulse(td.pPhase, td.pFreq);
+    const lenMult  = 1.0 + cp * chunkAmt * 1.0;
+    const baseA    = td.alpha*flicker*(0.58+ringGlow*0.42); if(baseA<0.05)continue;
+    const maxLen = td.baseLength * tendExt * lenMult;
+    const sW1 = Math.sin(t*0.30+td.phase)*0.026;
+    const sW2 = Math.cos(t*0.24+td.phase+1.1)*0.020;
+    const path3=[[0,0,0]];
+    for(const wp of td.waypts){
+      const l1=wp.j1+sW1*(1-wp.frac), l2=wp.j2+sW2*(1-wp.frac);
+      path3.push([td.d3[0]*maxLen*wp.frac+td.p1[0]*l1+td.p2[0]*l2,
+                  td.d3[1]*maxLen*wp.frac+td.p1[1]*l1+td.p2[1]*l2,
+                  td.d3[2]*maxLen*wp.frac+td.p1[2]*l1+td.p2[2]*l2]);
+    }
+    path3.push(scl3(td.d3,maxLen));
+    const pts=path3.map(p=>proj(p,camX));
+    const avgSc=pts.reduce((s,p)=>s+p.sc,0)/pts.length;
+    const a=baseA*dA(avgSc); if(a<0.04)continue;
+    const w=td.width*(R/200)*Math.max(0.5,avgSc);
+    ctx.lineCap='round';ctx.lineJoin='round';
+    ctx.beginPath();ctx.moveTo(pts[0].sx,pts[0].sy);
+    for(let s=1;s<pts.length;s++)ctx.lineTo(pts[s].sx,pts[s].sy);
+    ctx.strokeStyle=rgba(CG,a*0.28);ctx.lineWidth=w*3.8;ctx.stroke();
+    ctx.beginPath();ctx.moveTo(pts[0].sx,pts[0].sy);
+    for(let s=1;s<pts.length;s++)ctx.lineTo(pts[s].sx,pts[s].sy);
+    ctx.strokeStyle=rgba(CP,a*0.80);ctx.lineWidth=w;ctx.stroke();
+    ctx.beginPath();ctx.moveTo(pts[0].sx,pts[0].sy);
+    for(let s=1;s<pts.length;s++)ctx.lineTo(pts[s].sx,pts[s].sy);
+    ctx.strokeStyle=rgba(CH,a*0.40);ctx.lineWidth=w*0.26;ctx.stroke();
+    {const pT=(t*td.pulseSpeed+td.pulsePhase)%1,sN=pts.length-1,sI=Math.floor(pT*sN),sF=(pT*sN)-sI;
+     if(sI<sN){const pa=pts[sI],pb=pts[sI+1],px=pa.sx+(pb.sx-pa.sx)*sF,py=pa.sy+(pb.sy-pa.sy)*sF;
+      const psc=(pa.sc+pb.sc)*0.5,pr2=4.2*(R/200)*Math.max(0.5,psc);
+      const pg=ctx.createRadialGradient(px,py,0,px,py,pr2*4);
+      pg.addColorStop(0,rgba(CW,a*0.95));pg.addColorStop(0.3,rgba(CH,a*0.65));pg.addColorStop(1,rgba(CP,0));
+      ctx.fillStyle=pg;ctx.beginPath();ctx.arc(px,py,pr2*4,0,Math.PI*2);ctx.fill();}}
+    if(td.hasBranch&&a>0.10){
+      const bIdx=Math.min(1+Math.floor(td.waypts.length*0.5),path3.length-2);
+      const bA2=proj(path3[bIdx],camX),bB2=proj(add3(path3[bIdx],scl3(td.bD3,td.branchLen*tendExt)),camX);
+      const bsc=(bA2.sc+bB2.sc)*0.5,bw=w*0.60*Math.max(0.4,bsc),ba=a*0.52;
+      ctx.beginPath();ctx.moveTo(bA2.sx,bA2.sy);ctx.lineTo(bB2.sx,bB2.sy);
+      ctx.strokeStyle=rgba(CG,ba*0.25);ctx.lineWidth=bw*3.0;ctx.stroke();
+      ctx.beginPath();ctx.moveTo(bA2.sx,bA2.sy);ctx.lineTo(bB2.sx,bB2.sy);
+      ctx.strokeStyle=rgba(CP,ba*0.70);ctx.lineWidth=bw*0.62;ctx.stroke();
+    }
+  }
+
+  // Layer 2 — Core Halo Rings
+  for(const hl of halos){
+    hl.rotAngle+=(Math.PI*2/hl.rotPeriod)*dt;
+    const ru=rodrigues(hl.u,hl.normal,hl.rotAngle);
+    const rv=rodrigues(hl.v,hl.normal,hl.rotAngle);
+    const ringCP  = cpulse(hl.pPhase, hl.pFreq);
+    const radius  = hl.baseRadius * (1.0 + ringCP * chunkAmt * 1.0);
+    const NR=80; const ring=[];
+    for(let s=0;s<=NR;s++){
+      const th2=(s/NR)*Math.PI*2;
+      const p3=scl3([ru[0]*Math.cos(th2)+rv[0]*Math.sin(th2),
+                     ru[1]*Math.cos(th2)+rv[1]*Math.sin(th2),
+                     ru[2]*Math.cos(th2)+rv[2]*Math.sin(th2)], radius);
+      ring.push(proj(p3,camX));
+    }
+    for(const seg of hl.segments){
+      const segCP = cpulse(seg.sPPhase, seg.sPFreq);
+      const wA    = 0.78+0.22*Math.sin(t*0.52+seg.wPhase);
+      const aBoost = 0.88 + segCP * 0.12;
+      const startI=Math.floor(seg.startFrac*NR)%NR, segLen=Math.floor(seg.arc*NR);
+      const sPts=[];
+      for(let s=0;s<=segLen;s++)sPts.push(ring[(startI+s)%NR]);
+      const avgSc=sPts.reduce((s,p)=>s+p.sc,0)/sPts.length;
+      const a=seg.alpha*wA*aBoost*(0.55+ringGlow*0.45)*dA(avgSc);
+      if(a<0.025||sPts.length<2)continue;
+      const w=seg.width*(R/200)*avgSc; ctx.lineCap='round';
+      ctx.beginPath();ctx.moveTo(sPts[0].sx,sPts[0].sy);
+      for(let s=1;s<sPts.length;s++)ctx.lineTo(sPts[s].sx,sPts[s].sy);
+      ctx.strokeStyle=rgba(CG,a*0.28);ctx.lineWidth=w*5.0;ctx.stroke();
+      ctx.beginPath();ctx.moveTo(sPts[0].sx,sPts[0].sy);
+      for(let s=1;s<sPts.length;s++)ctx.lineTo(sPts[s].sx,sPts[s].sy);
+      ctx.strokeStyle=rgba(CP,a*0.72);ctx.lineWidth=w;ctx.stroke();
+      ctx.beginPath();ctx.moveTo(sPts[0].sx,sPts[0].sy);
+      for(let s=1;s<sPts.length;s++)ctx.lineTo(sPts[s].sx,sPts[s].sy);
+      ctx.strokeStyle=rgba(CH,a*0.46);ctx.lineWidth=w*0.28;ctx.stroke();
+    }
+  }
+
+  // Layer 1 — Energy Kernel
+  const bloom=ctx.createRadialGradient(CX,CY,0,CX,CY,kR*8.0);
+  bloom.addColorStop(0,   rgba(CG,0.52+cA*0.18));
+  bloom.addColorStop(0.14,rgba(CP,0.32+cA*0.10));
+  bloom.addColorStop(0.42,rgba(CG,0.08));
+  bloom.addColorStop(1,   rgba(CP,0));
+  ctx.fillStyle=bloom;ctx.beginPath();ctx.arc(CX,CY,kR*8.0,0,Math.PI*2);ctx.fill();
+  const midH=ctx.createRadialGradient(CX,CY,0,CX,CY,kR*3.0);
+  midH.addColorStop(0,   rgba(CH,0.90+cA*0.10));
+  midH.addColorStop(0.40,rgba(CP,0.62));
+  midH.addColorStop(1,   rgba(CG,0));
+  ctx.fillStyle=midH;ctx.beginPath();ctx.arc(CX,CY,kR*3.0,0,Math.PI*2);ctx.fill();
+  const core=ctx.createRadialGradient(CX,CY,0,CX,CY,kR);
+  core.addColorStop(0,   rgba(CW,0.98));
+  core.addColorStop(0.25,rgba(CH,0.95));
+  core.addColorStop(0.65,rgba(CP,0.82));
+  core.addColorStop(1,   rgba(CG,0.55));
+  ctx.fillStyle=core;ctx.beginPath();ctx.arc(CX,CY,kR,0,Math.PI*2);ctx.fill();
+
+  // Solar Flares
+  flareAcc += flareRate * dt;
+  while(flareAcc >= 1) { flareAcc--; spawnFlare(kR * 1.6); }
+  for(let i=sFlares.length-1;i>=0;i--){
+    sFlares[i].t += dt;
+    if(sFlares[i].t >= sFlares[i].dur) { sFlares.splice(i,1); continue; }
+    drawFlare(sFlares[i]);
+  }
+
+  // Neural overlay
+  drawNeuralOverlay(t, cNB, cLB);
+  ctx.globalCompositeOperation='source-over';
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

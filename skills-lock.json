@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "skills": {
+    "macos-development": {
+      "source": "rshankras/claude-code-apple-skills",
+      "sourceType": "github",
+      "computedHash": "ff7fba1c081a1efb29e67526abc4e281fbb482f10e2b364f11fbbe85c2d34e05"
+    },
+    "openai-agents-sdk": {
+      "source": "laguagu/claude-code-nextjs-skills",
+      "sourceType": "github",
+      "computedHash": "a31ea6e4ae0ce69bf408a984cafaae6c09cad41ac28bce7e68454f1af3d5b1bb"
+    },
+    "skill-creator": {
+      "source": "daymade/claude-code-skills",
+      "sourceType": "github",
+      "computedHash": "4fb6b1d8608b7fea46c0daa8f2c3e1f64dcbbbf5240178e09427152b14fe7ffd"
+    }
+  }
+}
