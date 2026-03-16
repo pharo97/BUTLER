@@ -44,7 +44,7 @@ function resize() {
   H = Math.round(canvas.clientHeight * dpr);
   canvas.width = W; canvas.height = H;
   CX = W * 0.5; CY = H * 0.5;
-  R  = Math.min(W, H) * 0.30;
+  R  = Math.min(W, H) * 0.34;
 }
 window.addEventListener('resize', resize);
 resize();
@@ -133,6 +133,8 @@ const halos = HALO_NORMALS.map((normal, i) => {
     rotPeriod:   (i%2===0 ? 1:-1) * (38 + i*9),
     pPhase: rng() * Math.PI * 2,
     pFreq:  0.55 + rng() * 0.90,
+    ampPhase: rng() * Math.PI * 2,
+    ampFreq:  1.2 + rng() * 1.8,
     segments: Array.from({length:4+i*2}, () => ({
       startFrac: rng(),
       arc:       0.10 + rng() * 0.22,
@@ -220,6 +222,12 @@ const frags = Array.from({length:N_FRAG}, () => {
     pPhase:      rng() * Math.PI * 2,
     pFreq:       0.35 + rng() * 0.80,
     phase:       rng() * Math.PI * 2,
+    scatterDir:  rng() > 0.5 ? 1 : -1,
+    scatterAmt:  0.15 + rng() * 0.35,
+    ampPhase:    rng() * Math.PI * 2,
+    ampFreq:     1.8 + rng() * 2.4,
+    breakAmt:    0.40 + rng() * 0.60,
+    driftAngle:  rng() * Math.PI * 2,
   };
 });
 // ── Solar Flares ──────────────────────────────────────────────────────────────
@@ -385,6 +393,8 @@ function drawNeuralOverlay(t, nb, lb) {
     }
   }
 }
+// ── Amplitude envelope (module-level — persists across frames) ────────────────
+var speakAmp = 0;
 // ── Render loop ────────────────────────────────────────────────────────────────
 let lastT = performance.now();
 function frame(now) {
@@ -413,6 +423,11 @@ function frame(now) {
   const cpulse = (pPhase, pFreq) =>
     heartbeat * 0.30 + Math.sin(t * pFreq * Math.PI * 2 + pPhase) * 0.70;
 
+  // Smooth amplitude envelope — asymmetric attack/decay
+  const isSpeak  = (cS > 2.5);
+  const atkLF    = isSpeak ? (1 - Math.pow(0.02, dt)) : (1 - Math.pow(0.08, dt));
+  speakAmp += (isSpeak ? cA : 0 - speakAmp) * atkLF;
+
   // ── Draw ──────────────────────────────────────────────────────────────────
   ctx.clearRect(0,0,W,H);
   const atm=ctx.createRadialGradient(CX,CY,0,CX,CY,R*2.1);
@@ -424,34 +439,62 @@ function frame(now) {
 
   // Layer 5 — Outer Fragment Shell
   for(const fg of frags) {
-    fg.rotAngle += (Math.PI*2/fg.rotPeriod)*dt*fragRot;
     const ru=rodrigues(fg.u,fg.axis,fg.rotAngle);
     const rv=rodrigues(fg.v,fg.axis,fg.rotAngle);
     const cp      = cpulse(fg.pPhase, fg.pFreq);
-    const radMult = 1.0 + cp * chunkAmt * 1.4;
     const aMult   = 0.82 + cp * 0.18;
-    const r       = fg.baseRadius * radMult;
+    const wobA    = 0.72+0.28*Math.sin(t*0.22+fg.phase);
+
+    // Per-fragment amplitude mod — staggered response
+    const fragAmpMod = speakAmp * (0.5 + 0.5 * Math.sin(t * fg.ampFreq + fg.ampPhase));
+
+    // Scatter: fragment radius expands outward (or inward) with amplitude
+    // Clamped to ±0.25 so fragments stay gravitationally bound to the core
+    const scatterR   = fg.scatterDir * Math.min(fg.scatterAmt, 0.25) * fragAmpMod;
+    const r          = fg.baseRadius * (1.0 + cp * chunkAmt * 1.4 + scatterR);
+
+    // Break: arc shortens as amplitude rises
+    const effectiveArcLen   = fg.arcLen * (1.0 - fg.breakAmt * fragAmpMod * 0.85);
+
+    // Drift: arc start drifts angularly at high amplitude
+    const arcStartDrift     = fg.driftAngle * fragAmpMod * 0.18;
+    const effectiveArcStart = fg.arcStart + arcStartDrift;
+
+    // Speed: rotation accelerates with amplitude
+    const effectiveFragRot = fragRot * (1.0 + fragAmpMod * 4.0);
+    fg.rotAngle += (Math.PI*2 / fg.rotPeriod) * dt * effectiveFragRot;
+
     const NP=22; const pts=[];
     for(let s=0;s<=NP;s++){
-      const th2=fg.arcStart+(s/NP)*fg.arcLen;
+      const th2=effectiveArcStart+(s/NP)*effectiveArcLen;
       const p3=scl3([ru[0]*Math.cos(th2)+rv[0]*Math.sin(th2),
                      ru[1]*Math.cos(th2)+rv[1]*Math.sin(th2),
                      ru[2]*Math.cos(th2)+rv[2]*Math.sin(th2)], r);
       pts.push(proj(p3,camX));
     }
-    const wobA   = 0.72+0.28*Math.sin(t*0.22+fg.phase);
-    const baseA  = fg.baseAlpha*wobA*aMult*(0.55+ringGlow*0.45);
+
+    // Alpha surges at high amplitude — capped so fragments don't overblast
+    const alphaBoost = 1.0 + Math.min(fragAmpMod * 0.8, 0.40);
+    const baseA  = fg.baseAlpha * wobA * aMult * (0.55 + ringGlow * 0.45) * alphaBoost;
+
+    // Fragment colour warms toward amber-white at high amplitude
+    // Cap at 0.28 so core gold/amber identity is always preserved
+    const fhot = Math.min(fragAmpMod * 0.55, 0.28);
+    const fCP  = [CP[0]+(CW[0]-CP[0])*fhot, CP[1]+(CW[1]-CP[1])*fhot, CP[2]+(CW[2]-CP[2])*fhot];
+    const fCH  = [CH[0]+(CW[0]-CH[0])*fhot, CH[1]+(CW[1]-CH[1])*fhot, CH[2]+(CW[2]-CH[2])*fhot];
+    const fCG  = [CG[0]+(CW[0]-CG[0])*fhot, CG[1]+(CW[1]-CG[1])*fhot, CG[2]+(CW[2]-CG[2])*fhot];
+
     const w      = fg.thickness*(R/200);
     for(let s=0;s<NP;s++){
       const pa=pts[s],pb=pts[s+1],avgSc=(pa.sc+pb.sc)*0.5;
       const a=baseA*dA(avgSc); if(a<0.022)continue;
       const ww=w*avgSc; ctx.lineCap='round';
       ctx.beginPath();ctx.moveTo(pa.sx,pa.sy);ctx.lineTo(pb.sx,pb.sy);
-      ctx.strokeStyle=rgba(CG,a*0.40);ctx.lineWidth=ww*4.2;ctx.stroke();
+      ctx.strokeStyle=rgba(fCG,a*0.40);ctx.lineWidth=ww*4.2;ctx.stroke();
       ctx.beginPath();ctx.moveTo(pa.sx,pa.sy);ctx.lineTo(pb.sx,pb.sy);
-      ctx.strokeStyle=rgba(CP,a*0.82);ctx.lineWidth=ww;ctx.stroke();
+      ctx.strokeStyle=rgba(fCP,a*0.82);ctx.lineWidth=ww;ctx.stroke();
       ctx.beginPath();ctx.moveTo(pa.sx,pa.sy);ctx.lineTo(pb.sx,pb.sy);
-      ctx.strokeStyle=rgba(CH,a*0.50);ctx.lineWidth=ww*0.28;ctx.stroke();
+      ctx.strokeStyle=rgba(fCH,a*0.50);ctx.lineWidth=ww*0.28;ctx.stroke();
     }
   }
 
@@ -562,7 +605,9 @@ function frame(now) {
     const ru=rodrigues(hl.u,hl.normal,hl.rotAngle);
     const rv=rodrigues(hl.v,hl.normal,hl.rotAngle);
     const ringCP  = cpulse(hl.pPhase, hl.pFreq);
-    const radius  = hl.baseRadius * (1.0 + ringCP * chunkAmt * 1.0);
+    // Amplitude-reactive halo expansion
+    const haloAmpMod = speakAmp * (0.4 + 0.6 * Math.sin(t * hl.ampFreq + hl.ampPhase));
+    const radius  = hl.baseRadius * (1.0 + ringCP * chunkAmt * 1.0 + haloAmpMod * 0.12);
     const NR=80; const ring=[];
     for(let s=0;s<=NR;s++){
       const th2=(s/NR)*Math.PI*2;
@@ -579,7 +624,7 @@ function frame(now) {
       const sPts=[];
       for(let s=0;s<=segLen;s++)sPts.push(ring[(startI+s)%NR]);
       const avgSc=sPts.reduce((s,p)=>s+p.sc,0)/sPts.length;
-      const a=seg.alpha*wA*aBoost*(0.55+ringGlow*0.45)*dA(avgSc);
+      const a=seg.alpha*wA*aBoost*(0.55+ringGlow*0.45)*dA(avgSc)*(1.0 + haloAmpMod * 0.5);
       if(a<0.025||sPts.length<2)continue;
       const w=seg.width*(R/200)*avgSc; ctx.lineCap='round';
       ctx.beginPath();ctx.moveTo(sPts[0].sx,sPts[0].sy);
