@@ -166,6 +166,15 @@ final class BirthPhaseCoordinator {
         // ── Phase 0: Dormant ────────────────────────────────────────────────────
         phase = .dormant
         visualEngine.setState(.idle)
+
+        // Request microphone + speech recognition permissions now, concurrently
+        // with the 2-second dark silence window. By the time the Q&A questioning
+        // phase calls voiceSystem.listen(), the TCC dialog has already appeared
+        // (and been granted or denied) — so listen() never blocks on a permission
+        // prompt mid-conversation. Fired as a non-awaited Task so the dormant
+        // delay runs in parallel and the birth animation is not held up.
+        Task { await self.voiceSystem.requestPermissions() }
+
         try? await Task.sleep(for: .seconds(2))
         guard !Task.isCancelled else { return }
 

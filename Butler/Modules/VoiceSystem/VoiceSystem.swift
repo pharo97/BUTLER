@@ -22,6 +22,14 @@ private let kBargeInFrames: Int = 3
 /// Cuts ~500 ms off the perceived latency for complete questions/commands.
 private let kVADEarlyEndpointFrames: Int = 13
 
+/// Absolute listen timeout: fire `stopListening()` after this many buffers regardless
+/// of whether the user spoke. At 44.1 kHz / 1024 samples ≈ 23 ms per buffer.
+/// 350 buffers ≈ 8 seconds. Prevents `listen()` from hanging forever when:
+///   • microphone permission is denied (audio tap receives only silent buffers)
+///   • the user never speaks during the Q&A questioning phase
+///   • any other condition that leaves `vad.hasSpoken` permanently false
+private let kVADAbsoluteTimeoutFrames: Int = 350  // ~8 s
+
 /// Returns `true` if `text` looks like a complete utterance (ends with `.`, `!`, or `?`).
 private func isSentenceComplete(_ text: String) -> Bool {
     let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -40,7 +48,12 @@ private final class VADState: @unchecked Sendable {
     var silentCount:      Int    = 0
     var hasSpoken:        Bool   = false
     var latestTranscript: String = ""
-    func reset() { silentCount = 0; hasSpoken = false; latestTranscript = "" }
+    /// Total buffers received since last reset. Used for the absolute timeout
+    /// (`kVADAbsoluteTimeoutFrames`) that fires `stopListening()` even if the
+    /// user never speaks — prevents `listen()` from hanging forever when
+    /// microphone permission is denied or the user stays silent.
+    var totalFrameCount:  Int    = 0
+    func reset() { silentCount = 0; hasSpoken = false; latestTranscript = ""; totalFrameCount = 0 }
 }
 
 /// Holds a weak reference without inheriting actor isolation.
@@ -175,6 +188,16 @@ private final class STTTapHandler: @unchecked Sendable {
     func installTap(on inputNode: AVAudioInputNode, format: AVAudioFormat) {
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [self] buffer, _ in
             self.req.append(buffer)
+
+            // Absolute timeout — fire stopListening() after ~8 s regardless of whether
+            // the user spoke. Guards against mic-permission-denied (silent buffers only)
+            // and users who stay silent during the Q&A phase.
+            self.vad.totalFrameCount += 1
+            if self.vad.totalFrameCount >= kVADAbsoluteTimeoutFrames {
+                self.vad.totalFrameCount = 0   // reset so we don't fire on every subsequent buffer
+                Task { @MainActor in self.weakVS.value?.stopListening() }
+                return
+            }
 
             let rms = rmsForBuffer(buffer)
             if rms > kVADSilenceThreshold {
