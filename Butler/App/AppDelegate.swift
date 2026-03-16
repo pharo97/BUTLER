@@ -235,17 +235,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window?.animator().alphaValue = 0
         } completionHandler: { [weak self] in
             Task { @MainActor [weak self] in
+                // Release the AppDelegate's coordinator reference FIRST — while the
+                // birth window (and therefore its NSHostingView → BirthPhaseView) is
+                // still alive and holding its own strong reference. This ensures the
+                // coordinator's retain count stays > 0 throughout SwiftUI's entire
+                // @Observable teardown, so observation-invalidation callbacks that
+                // fire on the next run-loop cycle after the NSHostingView is released
+                // never touch freed memory.
+                //
+                // Order matters:
+                //   1. birthCoordinator = nil   ← drops AppDelegate's +1 ref
+                //   2. birthPhaseWindow = nil   ← drops window's +1, releases NSHostingView
+                //      → SwiftUI tears down BirthPhaseView → releases view's +1
+                //      → coordinator dealloc (ref count → 0)
+                //   3. showGlassChamber()
+                //
+                // If we nil the window first (old order), the coordinator could reach
+                // ref-count 0 while @Observable teardown callbacks are still queued,
+                // producing EXC_BAD_ACCESS code=1 at address=0x0 in objc_msgSend.
+                self?.birthCoordinator = nil
                 self?.birthPhaseWindow?.close()
                 self?.birthPhaseWindow = nil
                 self?.showGlassChamber()
-                // Defer coordinator release by one run-loop tick.
-                // SwiftUI's @Observable teardown is asynchronous — it unregisters
-                // observation trackers on the next run-loop cycle after the
-                // NSHostingView is released. Releasing the coordinator immediately
-                // causes swift_getObjectType to read freed memory (PAC failure,
-                // EXC_BAD_ACCESS code=257) when those deferred trackers fire.
-                try? await Task.sleep(for: .milliseconds(100))
-                self?.birthCoordinator = nil
             }
         }
     }
