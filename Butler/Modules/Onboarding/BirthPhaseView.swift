@@ -135,8 +135,10 @@ struct BirthPhaseView: View {
     private var orbView: some View {
         switch coordinator.phase {
         case .dormant, .booting, .digitalAwakening, .voiceReceived:
-            // Birth orb visual placeholder — awaiting new design
-            Color.clear
+            BirthOrbView(
+                phase:      coordinator.phase,
+                isSpeaking: coordinator.isSpeakingNow
+            )
 
         default:
             PulseWebView(
