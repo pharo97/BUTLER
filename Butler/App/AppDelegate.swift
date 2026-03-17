@@ -109,13 +109,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
         }
 
-        // Determine whether to show onboarding or go straight to Glass Chamber
+        // Determine whether to show onboarding or go straight to Glass Chamber.
+        //
+        // IMPORTANT: warm the Swift concurrency main-actor executor BEFORE creating
+        // any SwiftUI window.
+        //
+        // `applicationDidFinishLaunching` is a pure AppKit ObjC delegate — no Swift
+        // concurrency Task is active. On macOS 26 (Swift 6 strict concurrency),
+        // SwiftUI's gesture handlers call `MainActor.assumeIsolated`, which calls
+        // `swift_task_isCurrentExecutorWithFlagsImpl`, which dereferences the Swift
+        // concurrency main-actor executor singleton. That singleton starts as nil and
+        // is initialized lazily on the first use of the Swift concurrency main actor.
+        //
+        // Strategy: create an async Task that yields twice on the main actor, then
+        // shows the window. The two yield points ensure the Swift concurrency runtime
+        // has fully registered its main-actor executor before any NSHostingView is
+        // created and before AppKit's first layout pass.
         let onboardingComplete = UserDefaults.standard.bool(forKey: "butler.onboarding.complete")
 
-        if onboardingComplete {
-            showGlassChamber()
-        } else {
-            showBirthPhase()
+        Task { @MainActor [weak self] in
+            // First yield: bootstraps the main-actor executor cooperative queue.
+            await Task.yield()
+            // Second yield: ensures any pending runtime initialization drains.
+            await Task.yield()
+
+            guard let self else { return }
+            if onboardingComplete {
+                self.showGlassChamber()
+            } else {
+                self.showBirthPhase()
+            }
         }
     }
 

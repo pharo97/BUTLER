@@ -109,32 +109,41 @@ struct VoiceSelectionView: View {
 
             Spacer(minLength: 4)
 
-            // Preview button
-            Button {
-                togglePreview(voice)
-            } label: {
-                Image(systemName: isPreviewing ? "stop.circle" : "speaker.wave.2")
-                    .font(.system(size: 12, weight: .regular))
-                    .foregroundColor(isPreviewing ? .cyan.opacity(0.9) : .white.opacity(0.55))
-                    .frame(width: 22, height: 22)
-            }
-            .buttonStyle(.plain)
+            // Preview and Select use .onTapGesture with Task { @MainActor in } bodies.
+            //
+            // On macOS 26 beta (Swift 6.2.3 + macOS Tahoe 25C56), SwiftUI's action
+            // dispatch pipeline calls `swift_task_isCurrentExecutorWithFlagsImpl` on
+            // the main actor executor object, which has an invalid isa pointer in
+            // this OS/runtime combination. Any closure that inherits @MainActor
+            // isolation from its enclosing View will crash when SwiftUI calls it
+            // during a layout/update pass from an AppKit RunLoop callback (no Task).
+            //
+            // Wrapping the action body in `Task { @MainActor in }` makes the closure
+            // itself nonisolated (no executor check at entry), while the actual work
+            // still runs on the main actor — after Swift concurrency has been
+            // properly initialized by the Task infrastructure.
+            Image(systemName: isPreviewing ? "stop.circle" : "speaker.wave.2")
+                .font(.system(size: 12, weight: .regular))
+                .foregroundColor(isPreviewing ? .cyan.opacity(0.9) : .white.opacity(0.55))
+                .frame(width: 22, height: 22)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    Task { @MainActor in togglePreview(voice) }
+                }
 
-            // Select button
-            Button {
-                selectVoice(voice)
-            } label: {
-                Text(isSelected ? "SELECTED" : "SELECT")
-                    .font(.system(size: 9, weight: .bold, design: .monospaced))
-                    .foregroundColor(isSelected ? .black : .white)
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 4)
-                    .background(
-                        RoundedRectangle(cornerRadius: 4)
-                            .fill(isSelected ? Color.white : Color.white.opacity(0.13))
-                    )
-            }
-            .buttonStyle(.plain)
+            Text(isSelected ? "SELECTED" : "SELECT")
+                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                .foregroundColor(isSelected ? .black : .white)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 4)
+                .background(
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(isSelected ? Color.white : Color.white.opacity(0.13))
+                )
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    Task { @MainActor in selectVoice(voice) }
+                }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
