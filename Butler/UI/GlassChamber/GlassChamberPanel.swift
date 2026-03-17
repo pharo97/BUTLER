@@ -84,7 +84,17 @@ final class GlassChamberPanel: NSPanel {
             audioDeviceManager:  audioDeviceManager,
             idleProcessor:       idleProcessor
         )
-        contentView = NSHostingView(rootView: rootView)
+
+        let hostingView = NSHostingView(rootView: rootView)
+
+        // The NSPanel is already opaque=false / backgroundColor=.clear, but
+        // NSHostingView creates its own CALayer whose backgroundColor defaults
+        // to opaque black. Without this, the panel renders with a solid black
+        // background even though the SwiftUI content is transparent.
+        hostingView.wantsLayer = true
+        hostingView.layer?.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 0)
+
+        contentView = hostingView
     }
 
     // MARK: - Private setup

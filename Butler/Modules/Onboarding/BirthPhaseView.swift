@@ -105,28 +105,25 @@ struct BirthPhaseView: View {
                 }
             }
         }
-        // Skip label — uses .onTapGesture with Task { @MainActor in } body.
-        //
-        // On macOS 26 beta (Swift 6.2.3 + Tahoe 25C56), SwiftUI's action dispatch
-        // pipeline calls `swift_task_isCurrentExecutorWithFlagsImpl` on a corrupted
-        // main actor executor object, crashing any @MainActor-isolated closure that
-        // runs during a layout/update pass from an AppKit RunLoop callback.
-        //
-        // The Task { @MainActor in } wrapper ensures the closure itself has no
-        // @MainActor isolation (no executor check injected), while the actual
-        // coordinator.skip() call runs on the main actor via the Task infrastructure.
+        // Skip label — AppKitTapOverlay bypasses SwiftUI's gesture dispatch to
+        // avoid the macOS 26 beta (25C56) EXC_BAD_ACCESS in
+        // swift_task_isCurrentExecutorWithFlagsImpl. See AppKitTapOverlay for
+        // the full explanation. The overlay fires via NSClickGestureRecognizer
+        // target-action (ObjC), not through Swift concurrency executor checks.
         .overlay(alignment: .topTrailing) {
-            Text("Skip")
-                .font(.system(size: 11, weight: .regular, design: .monospaced))
-                .foregroundStyle(.white.opacity(0.30))
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    Task { @MainActor in coordinator.skip() }
-                }
-                .padding(.top, 16)
-                .padding(.trailing, 16)
+            ZStack(alignment: .topTrailing) {
+                Text("Skip")
+                    .font(.system(size: 11, weight: .regular, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.30))
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+
+                AppKitTapOverlay { coordinator.skip() }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+            }
+            .padding(.top, 16)
+            .padding(.trailing, 16)
         }
         .frame(minWidth: 480, minHeight: 600)
         .onAppear {
