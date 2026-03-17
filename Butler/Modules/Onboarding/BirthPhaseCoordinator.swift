@@ -118,7 +118,7 @@ final class BirthPhaseCoordinator {
 
     private var answers: [String: String] = [:]
 
-    // MARK: - Init
+    // MARK: - Init / Deinit
 
     init(
         voiceSystem:     VoiceSystem,
@@ -129,6 +129,7 @@ final class BirthPhaseCoordinator {
         self.activityMonitor = activityMonitor
         self.visualEngine    = visualEngine
     }
+
 
     // MARK: - Entry point
 
@@ -143,26 +144,46 @@ final class BirthPhaseCoordinator {
 
     /// Skips the sequence, marks onboarding complete, and fires dismiss.
     func skip() {
-        soundEngine.stop()
-
-        // Stop birth-phase synth (used in phases 0–3)
-        glitchSynth.stopSpeaking(at: .immediate)
-
-        // Stop VoiceSystem TTS + STT (used in questioning / declaring phases).
-        // Without these calls the `while isSpeaking` polling loop in VoiceSystem.speak()
-        // and/or the UnsafeContinuation in listen() keep running after sequenceTask is
-        // cancelled, because `try? await Task.sleep` silently swallows CancellationError.
-        // That leaves VoiceSystem in listening/speaking state when GlassChamberView
-        // takes over, causing `alreadyListening` errors and potential UAF if the
-        // speak() polling loop references objects torn down during the window transition.
-        voiceSystem.stopSpeaking()
-        voiceSystem.stopListening()
-
+        teardownAudio()
         voiceHasBeenSelected = true             // unblock the polling loop if waiting
         sequenceTask?.cancel()
         sequenceTask = nil
         UserDefaults.standard.set(true, forKey: "butler.onboarding.complete")
         isComplete = true
+    }
+
+    /// Stops every audio resource owned by the coordinator.
+    ///
+    /// Called from both exit paths — `skip()` and natural sequence completion —
+    /// so the `DigitalSoundEngine`'s `AVAudioEngine` and `glitchSynth` are always
+    /// fully stopped before the coordinator is released.
+    ///
+    /// ## Why this matters
+    ///
+    /// `DigitalSoundEngine.stop()` calls `AVAudioEngine.stop()`. Without it, the
+    /// engine stays in its "started but idle" state after the ambient chatter loop
+    /// ends. When BirthPhaseCoordinator is then freed (ARC dealloc), AVFoundation's
+    /// real-time audio render thread may still be accessing the engine's internal
+    /// node graph concurrently with ARC releasing the engine and its player node →
+    /// use-after-free → EXC_BAD_ACCESS (code=1, address=0x0).
+    ///
+    /// `glitchSynth.stopSpeaking(at: .immediate)` ensures the synthesiser is idle
+    /// before the coordinator and its properties are released.
+    ///
+    /// `voiceSystem.stopSpeaking()` / `voiceSystem.stopListening()` flush any
+    /// in-progress Q&A turn so VoiceSystem hands off to GlassChamberView cleanly.
+    private func teardownAudio() {
+        // Birth-phase procedural sounds
+        glitchSynth.stopSpeaking(at: .immediate)
+        soundEngine.stop()
+
+        // VoiceSystem TTS + STT (active during questioning / declaring phases).
+        // Without these, the `while isSpeaking` polling loop and/or the
+        // UnsafeContinuation in listen() keep running after sequenceTask is cancelled
+        // (try? await Task.sleep swallows CancellationError), leaving VoiceSystem
+        // in a dirty state when GlassChamberView takes over.
+        voiceSystem.stopSpeaking()
+        voiceSystem.stopListening()
     }
 
     // MARK: - Voice gate (called by VoiceSelectionView)
@@ -305,6 +326,26 @@ final class BirthPhaseCoordinator {
 
         // ── Complete ────────────────────────────────────────────────────────────
         visualEngine.setState(.idle)
+
+        // Stop the DigitalSoundEngine's AVAudioEngine before releasing the coordinator.
+        //
+        // stopAmbientChatter() (called at the Phase 2 → Phase 3 transition) kills the
+        // chatter Task loop and sets isChatterRunning = false, but it does NOT stop the
+        // underlying AVAudioEngine — that engine remains in a "started but idle" state
+        // for the rest of the birth sequence (Phase 3 chime plays through it).
+        //
+        // skip() calls soundEngine.stop() explicitly, but the normal completion path
+        // did not. When BirthPhaseCoordinator is released (ARC dealloc) with the engine
+        // still running, AVFoundation's real-time audio render thread may access the
+        // engine's internal node graph concurrently with ARC releasing the engine and
+        // its player node → use-after-free → EXC_BAD_ACCESS (code=1, address=0x0).
+        soundEngine.stop()
+
+        // Nil the sequence task handle now that the sequence has finished naturally.
+        // skip() already nils it for the early-exit path; the normal completion path
+        // was not doing this, leaking the (completed) Task object until coordinator dealloc.
+        sequenceTask = nil
+
         UserDefaults.standard.set(true, forKey: "butler.onboarding.complete")
         phase      = .complete
         isComplete = true
