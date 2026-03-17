@@ -72,6 +72,13 @@ struct VoiceSelectionView: View {
             RoundedRectangle(cornerRadius: 12)
                 .stroke(Color.white.opacity(0.10), lineWidth: 0.75)
         )
+        .onDisappear {
+            // Stop any in-progress preview so the synthesizer is silent when
+            // the voice-received phase begins. Without this, the preview voice
+            // overlaps BUTLER's first spoken words.
+            previewSynth.stopSpeaking(at: .immediate)
+            previewingID = nil
+        }
     }
 
     // MARK: - Voice row

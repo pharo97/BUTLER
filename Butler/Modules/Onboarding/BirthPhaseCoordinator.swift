@@ -144,7 +144,20 @@ final class BirthPhaseCoordinator {
     /// Skips the sequence, marks onboarding complete, and fires dismiss.
     func skip() {
         soundEngine.stop()
-        glitchSynth.stopSpeaking(at: .immediate)   // stop mid-speech so delegate fires didCancel → cont.resume() cleanly
+
+        // Stop birth-phase synth (used in phases 0–3)
+        glitchSynth.stopSpeaking(at: .immediate)
+
+        // Stop VoiceSystem TTS + STT (used in questioning / declaring phases).
+        // Without these calls the `while isSpeaking` polling loop in VoiceSystem.speak()
+        // and/or the UnsafeContinuation in listen() keep running after sequenceTask is
+        // cancelled, because `try? await Task.sleep` silently swallows CancellationError.
+        // That leaves VoiceSystem in listening/speaking state when GlassChamberView
+        // takes over, causing `alreadyListening` errors and potential UAF if the
+        // speak() polling loop references objects torn down during the window transition.
+        voiceSystem.stopSpeaking()
+        voiceSystem.stopListening()
+
         voiceHasBeenSelected = true             // unblock the polling loop if waiting
         sequenceTask?.cancel()
         sequenceTask = nil

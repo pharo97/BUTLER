@@ -493,16 +493,37 @@ final class VoiceSystem {
     }
 
     fileprivate func finishListening(_ result: Result<String, Error>) {
+        // ── Idempotency guard ────────────────────────────────────────────────
+        // Multiple code paths can race to call finishListening on @MainActor:
+        //   • VAD silence timer  → stopListening() → finishListening()
+        //   • Absolute timeout   → stopListening() → finishListening()
+        //   • Recognition final  → finishListening() directly
+        //   • Recognition error  → finishListening() directly
+        //
+        // All arrive via Task { @MainActor in … } dispatched from background threads.
+        // The second caller would invoke cleanupAudio() with no tap installed, which
+        // calls audioEngine.inputNode.removeTap(onBus: 0) on an already-torn-down
+        // engine — CoreAudio dereferences a null tap-list entry →
+        // EXC_BAD_ACCESS (code=1, address=0x0).
+        //
+        // Guarding on isListening here ensures cleanupAudio() runs exactly once per
+        // listen() call. All other callers return immediately.
+        guard isListening else { return }
+
         recognitionTask?.cancel()
         recognitionTask = nil
         cleanupAudio()
         isListening = false
 
-        switch result {
-        case .success(let text):  listenContinuation?.resume(returning: text)
-        case .failure(let error): listenContinuation?.resume(throwing: error)
-        }
+        // Nil the continuation BEFORE resuming it.
+        // Atomic swap prevents any theoretical double-resume if a second finishListening
+        // call manages to slip past the guard during a suspension point.
+        let cont = listenContinuation
         listenContinuation = nil
+        switch result {
+        case .success(let text):  cont?.resume(returning: text)
+        case .failure(let error): cont?.resume(throwing: error)
+        }
     }
 
     private func cleanupAudio() {
@@ -678,12 +699,15 @@ final class VoiceSystem {
             del.onQueueEmpty = { [weak self] in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
-                    self.isSpeaking         = false
+                    self.isSpeaking        = false
                     self.stopAmplitudeSimulation()
-                    self.streamingDelegate  = nil
+                    self.streamingDelegate = nil
                     self.audioDuckManager?.restore()
-                    self.drainContinuation?.resume()
+                    // Atomic swap — nil before resume to prevent double-resume
+                    // if stopSpeaking() already ran and cleared drainContinuation.
+                    let drain = self.drainContinuation
                     self.drainContinuation = nil
+                    drain?.resume()
                 }
             }
             streamingDelegate    = del
@@ -836,9 +860,13 @@ final class VoiceSystem {
         // Clean up both paths
         blockingDelegate   = nil
         streamingDelegate  = nil
-        // Unblock drainQueue() if it was waiting
-        drainContinuation?.resume()
+        // Unblock drainQueue() if it was waiting.
+        // Atomic swap: nil before resume so StreamingSynthDelegate.onQueueEmpty's
+        // Task { @MainActor in } can't double-resume a stale continuation if it
+        // was already queued when stopSpeaking() ran.
+        let drain = drainContinuation
         drainContinuation = nil
+        drain?.resume()
     }
 
     // MARK: - Utterance factory

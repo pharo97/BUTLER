@@ -302,20 +302,34 @@ struct BirthPhaseView: View {
 // MARK: - BlinkingCursor
 
 /// A monospaced blinking block cursor used in the boot text view.
+///
+/// ## Task lifecycle
+///
+/// The blink loop is stored in `@State var blinkTask` and explicitly cancelled in
+/// `.onDisappear`. Without this, the `Task { @MainActor in while !Task.isCancelled }`
+/// pattern leaks the task when the boot phase ends and `BlinkingCursor` is removed
+/// from the view hierarchy — the task runs indefinitely in the background, toggling
+/// a stale `@State` binding on a view node that no longer exists.
 private struct BlinkingCursor: View {
-    @State private var visible = true
+    @State private var visible   = true
+    @State private var blinkTask: Task<Void, Never>? = nil
 
     var body: some View {
         Text("_")
             .font(.system(size: 11, weight: .regular, design: .monospaced))
             .foregroundStyle(Color(red: 0.35, green: 1.00, blue: 0.72).opacity(visible ? 0.85 : 0.0))
             .onAppear {
-                Task { @MainActor in
+                blinkTask = Task { @MainActor in
                     while !Task.isCancelled {
                         try? await Task.sleep(for: .milliseconds(550))
+                        guard !Task.isCancelled else { break }
                         visible.toggle()
                     }
                 }
+            }
+            .onDisappear {
+                blinkTask?.cancel()
+                blinkTask = nil
             }
     }
 }
