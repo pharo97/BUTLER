@@ -345,18 +345,29 @@ All distributed binaries are:
 
 ## 4. User Onboarding Flow
 
-### 4.1 First Launch Sequence
+> **Implementation Note:** The Birth Phase as shipped is a cinematic awakening sequence, not a multi-screen wizard. Full specification in **PRD-20-Birth-Phase.md**.
+
+### 4.1 Birth Phase Sequence (Implemented)
 ```
-1. Welcome screen — product introduction (30 seconds)
-2. Name your BUTLER
-3. Select voice personality
-4. Permission tier selection (see Section 5)
-5. Quick voice calibration
-6. Tutorial scenario (simulated suggestion + response)
-7. Main experience begins
+Phase 0 — Dormant:       Window appears, orb invisible, permissions requested
+Phase 1 — Booting:       Typewriter boot log, monospaced, no audio
+Phase 2 — Digital Awakening: Ambient procedural audio, voice selection table
+Phase 3 — Voice Received: Ascending chime, BUTLER speaks first words
+Phase 4 — Discovery:     BUTLER reads frontmost app, introduces itself
+Phase 5 — Questioning:   5 Q&A turns via voice (name, role, project, challenge, style)
+Phase 6 — Declaring:     BUTLER announces readiness, memory seeded
+Phase 7 — Complete:      Transitions to Glass Chamber
 ```
 
-### 4.2 Trust Building Principle
+**Skip available at any phase** — jumps directly to Glass Chamber.
+
+### 4.2 Data Captured During Birth Phase
+- Selected TTS voice (persisted to UserDefaults)
+- User name (UserDefaults + MemoryWriter)
+- Role, current project, current challenge (MemoryWriter)
+- Preferred communication style (MemoryWriter + personality prompt)
+
+### 4.3 Trust Building Principle
 - BUTLER starts at Tier 0 (passive) by default
 - Tiers are unlocked one at a time, with clear explanation of what each enables
 - Permission dashboard is always accessible from Settings

@@ -7,20 +7,29 @@
 
 ---
 
-## 1. First Launch & Onboarding Flow
+## 1. First Launch & Onboarding Flow (Birth Phase)
+
+> **Status:** Implemented. This flow replaces the original multi-screen wizard design.
+> Full specification: **PRD-20-Birth-Phase.md**
 
 ```
 ┌─────────────────────────────────────────────────────┐
 │                    APP LAUNCH                       │
+│         (checks butler.onboarding.complete)         │
 └──────────────────────────┬──────────────────────────┘
                            │
-                           ▼
+              ┌────────────┴────────────┐
+              │ false                   │ true
+              ▼                         ▼
+     Birth Phase Window          Glass Chamber
+       (620 × 700 pt)            (skip to §2)
+       NSVisualEffectView
+       glass + border
+              │
+              ▼
 ┌─────────────────────────────────────────────────────┐
-│           WELCOME SCREEN (30 seconds)               │
-│   "Meet BUTLER — your digital operating companion"  │
-│   [Animated pulse intro — idle → thinking → gold]  │
-│                                                     │
-│              [Get Started]                          │
+│  PHASE 0: DORMANT (2s)                              │
+│   Orb invisible. TCC permission dialogs dispatched. │
 └──────────────────────────┬──────────────────────────┘
                            │
                            ▼
