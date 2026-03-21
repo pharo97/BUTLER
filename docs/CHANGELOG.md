@@ -7,6 +7,21 @@ Format: `[YYYY-MM-DD] Type — Description (commit)`
 
 ## 2026-03-21
 
+### fix — 8 PRD-20 divergences in birth phase (commit `9e0b85e`)
+**Files:** `BirthPhaseViewController.swift`, `BirthOrbView.swift`, `BirthPhaseCoordinator.swift`, `AppDelegate.swift`
+
+Fixed all 8 confirmed divergences from the PRD-20 birth phase specification:
+
+- **BUG-A1** — Orb was visible during dormant (Phase 0). `birthOrbView.isHidden = false` was set on `.dormant` case entry. Fixed: the entire `orbContainerView` is now hidden by default in `buildUI()` and on `.dormant` case entry; `.booting` reveals it.
+- **BUG-B1** — `OrbLayerDelegate` used amber/gold colors for all phases. PRD requires cold-blue for phases 0–2 (dormant, booting, digitalAwakening) and gold/amber only on the voiceReceived surge. Fixed: added `coldGlow`/`coldCore`/`coldHot` static helpers and `isWarmPhase` computed var. Phase-aware instance methods `glowColor`/`coreColor`/`hotColor` route to the correct palette. All drawing routines (`drawCore`, `drawArcs`, `drawFlare`, `drawSpark`) updated to use the instance accessors.
+- **BUG-D1/M1** — `updatePulseWebView` only mapped to two states (speaking/idle). PRD requires four states. Fixed: new three-parameter `updatePulseWebView(isSpeaking:isListening:isThinking:)` emits `listening(0.5)` during user answer turns and `idle(0.2)` between turns.
+- **BUG-D2** — PulseWebView never entered `thinking` state. Fixed by BUG-D1 fix: `isThinking = (coordinator.phase == .discovery && !isSpeaking && !isListening)` covers the 1-second discovery window before BUTLER begins speaking.
+- **BUG-F2** — Q1 answer wrote to both `UserDefaults["butler.user.name"]` AND `MemoryWriter(.personal)`. PRD spec only defines the UserDefaults write for Q1. Fixed: removed `MemoryWriter.shared.appendFact("User's name: ...")` from the `"name"` case.
+- **BUG-H1** — Window fade animation used `ctx.duration = 0.5`. PRD specifies 0.6s. Fixed in `AppDelegate.handleBirthComplete()`.
+- **BUG-L1** — Mic indicator was shown on Phase 5 (questioning) entry before `isListeningForAnswer == true`. `startMicPulse()` forced `micIndicatorView.isHidden = false`. Fixed: `startMicPulse()` no longer sets visibility; it only starts the animation timer. Visibility is exclusively controlled by the 80ms `syncUI` loop via `micIndicatorView.isHidden = !isListening`.
+
+---
+
 ### feat — Birth Phase: Pure AppKit NSViewController (commit `6c9878b`)
 **Files:** `BirthPhaseViewController.swift` (new), `AppDelegate.swift`
 
