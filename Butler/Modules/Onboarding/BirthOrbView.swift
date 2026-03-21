@@ -1,38 +1,35 @@
-import SwiftUI
 import AppKit
-import CoreVideo
 import QuartzCore
 
-// MARK: - BirthOrbView
+// MARK: - BirthOrbView (NSViewRepresentable bridge)
 
 /// Pure AppKit / CoreGraphics orb for the onboarding birth sequence (phases 0–3).
 ///
-/// ## Why NSViewRepresentable instead of SwiftUI Canvas?
+/// ## Rendering architecture
 ///
-/// On macOS 26 (Swift 6 strict concurrency) SwiftUI's `Canvas` and `TimelineView`
-/// both go through the AttributeGraph — specifically `CanvasDisplayList.updateValue()`
-/// and `TimelineView.UpdateFilter.updateValue()` — which call
-/// `Attribute.syncMainIfReferences` → `swift_task_isCurrentExecutorWithFlagsImpl`.
-/// That runtime function dereferences the Swift concurrency main-actor executor
-/// singleton, which is initialized lazily on the first Swift `Task` execution.
-/// Any AppKit RunLoop callback (CATransaction observer, NSTimer) that triggers a
-/// SwiftUI layout/update before the first `Task` has run finds the singleton nil →
-/// `EXC_BAD_ACCESS (SIGSEGV)` at address 0x1e on every cold launch during onboarding.
+/// All animation state lives in `BirthOrbNSView` and `OrbLayerDelegate`, both
+/// accessed exclusively on the main thread via `CADisplayLink`. There are no raw
+/// C callbacks, no `CVDisplayLink`, no cross-thread state reads.
 ///
-/// Overriding `NSView.draw(_:)` has the same problem: `NSView` is `@MainActor`-isolated
-/// in Swift 6, so the Swift compiler injects `_checkExpectedExecutor` at the entry of
-/// our override, which also calls `swift_task_isCurrentExecutorWithFlagsImpl` → crash.
+/// `OrbLayerDelegate.draw(layer:in:)` is a `CALayerDelegate` method — the Swift
+/// compiler does NOT inject `@MainActor` executor checks there, avoiding the
+/// `swift_task_isCurrentExecutorWithFlagsImpl` crash that fires when AppKit's
+/// layer-rendering pipeline calls an `@MainActor`-isolated `draw(_:)` override
+/// before any Swift `Task` has initialized the main-actor executor singleton.
 ///
-/// ## The solution: CALayerDelegate
+/// ## Why not CVDisplayLink?
 ///
-/// `CALayerDelegate.draw(layer:in:)` is defined in a plain Swift protocol with NO
-/// `@MainActor` isolation — the Swift compiler does NOT inject executor checks into it.
-/// All drawing is done in `OrbLayerDelegate` (a plain `NSObject` subclass, not `NSView`)
-/// via direct CoreGraphics calls on the `CGContext` provided by CALayer. The CVDisplayLink
-/// callback calls `CALayer.setNeedsDisplay()` directly, bypassing all AppKit drawing paths.
+/// `CVDisplayLink` fires its callback on a private display thread. Any state
+/// written on the main thread (phase, isSpeaking) and read on the display thread
+/// is a data race under Swift 6 strict concurrency — and a latent use-after-free
+/// if `Unmanaged.passRetained` is not balanced with a corresponding release before
+/// `deinit` completes. `CADisplayLink` fires on the main run loop at display
+/// refresh rate, eliminating all cross-thread access.
+import SwiftUI
+
 struct BirthOrbView: NSViewRepresentable {
 
-    var phase: BirthPhase
+    var phase:      BirthPhase
     var isSpeaking: Bool
 
     func makeNSView(context: Context) -> BirthOrbNSView {
@@ -50,14 +47,15 @@ struct BirthOrbView: NSViewRepresentable {
 
 // MARK: - BirthOrbNSView
 
-/// A thin `NSView` container that hosts a `CALayer` drawn by `OrbLayerDelegate`.
+/// `NSView` container that drives the orb animation via `CADisplayLink`.
 ///
-/// This class MUST NOT override `draw(_:)` — doing so would reintroduce the
-/// `@MainActor` executor check crash. All rendering is delegated to `OrbLayerDelegate`
-/// via `CALayer.delegate = orbDelegate`.
+/// All state mutations and all rendering occur on the main thread — `CADisplayLink`
+/// is scheduled on `RunLoop.main` and fires its selector on `@MainActor`.
+/// No raw C callback, no `Unmanaged` retain/release bookkeeping.
+@MainActor
 final class BirthOrbNSView: NSView {
 
-    // MARK: - Public state
+    // MARK: - Public state (main thread only)
 
     var orbPhase: BirthPhase = .dormant {
         didSet { orbDelegate.phase = orbPhase }
@@ -70,9 +68,8 @@ final class BirthOrbNSView: NSView {
 
     private let orbDelegate = OrbLayerDelegate()
 
-    // nonisolated(unsafe) because CVDisplayLink is a CF type (not Sendable)
-    // and deinit is nonisolated in Swift 6.
-    nonisolated(unsafe) private var displayLink: CVDisplayLink?
+    /// `CADisplayLink` fires on the main run loop — no threading contract to uphold.
+    private var displayLink: CADisplayLink?
 
     // MARK: - Setup
 
@@ -88,77 +85,73 @@ final class BirthOrbNSView: NSView {
         startDisplayLink()
     }
 
+    deinit {
+        // CADisplayLink invalidation is safe from deinit because the target is
+        // `self` (held weakly by CADisplayLink internally), and invalidate() is
+        // documented to be callable from any thread.
+        displayLink?.invalidate()
+        displayLink = nil
+    }
+
     private func setupLayer() {
         wantsLayer = true
-        // Assign OrbLayerDelegate as the CALayer's drawing delegate.
-        // CALayerDelegate.draw(layer:in:) has NO @MainActor isolation —
-        // the compiler does not inject executor checks there.
-        layer?.delegate = orbDelegate
+        layer?.delegate   = orbDelegate
         layer?.backgroundColor = CGColor.clear
-        layer?.contentsScale = (window?.backingScaleFactor) ?? NSScreen.main?.backingScaleFactor ?? 2.0
+        layer?.contentsScale = (window?.backingScaleFactor)
+            ?? NSScreen.main?.backingScaleFactor
+            ?? 2.0
     }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        // Update contentsScale when moved to a display.
-        layer?.contentsScale = (window?.backingScaleFactor) ?? NSScreen.main?.backingScaleFactor ?? 2.0
+        layer?.contentsScale = (window?.backingScaleFactor)
+            ?? NSScreen.main?.backingScaleFactor
+            ?? 2.0
     }
 
-    deinit {
-        if let link = displayLink {
-            CVDisplayLinkStop(link)
-        }
-    }
-
-    // MARK: - CVDisplayLink
+    // MARK: - CADisplayLink
 
     private func startDisplayLink() {
-        var link: CVDisplayLink?
-        CVDisplayLinkCreateWithActiveCGDisplays(&link)
-        guard let link else { return }
-
-        // Capture the layer directly (not self) to avoid retain cycles.
-        // `orbDelegate` is retained by the layer's delegate property.
-        // We pass the OrbLayerDelegate pointer through userInfo.
-        let delegatePtr = Unmanaged.passRetained(orbDelegate).toOpaque()
-
-        CVDisplayLinkSetOutputCallback(link, { _, _, _, _, _, userInfo -> CVReturn in
-            guard let ptr = userInfo else { return kCVReturnError }
-            let delegate = Unmanaged<OrbLayerDelegate>.fromOpaque(ptr).takeUnretainedValue()
-            // setNeedsDisplay on the layer — this is a CALayer call, NOT an NSView call.
-            // It does NOT go through AppKit's @MainActor-isolated drawing path.
-            // Plain GCD dispatch to main queue is fine; no Swift Task needed.
-            DispatchQueue.main.async {
-                delegate.hostLayer?.setNeedsDisplay()
-            }
-            return kCVReturnSuccess
-        }, delegatePtr)
-
-        CVDisplayLinkStart(link)
+        // CADisplayLink fires its selector on the run loop it was added to.
+        // Adding to .main means the selector always runs on the main thread —
+        // the same thread that owns all BirthOrbNSView and OrbLayerDelegate state.
+        let link = CADisplayLink(target: self, selector: #selector(displayLinkFired))
+        link.add(to: .main, forMode: .common)
         self.displayLink = link
-
-        // Wire the delegate to the layer after the link is running.
         orbDelegate.hostLayer = layer
     }
 
-    // DO NOT override draw(_ dirtyRect:) — it is @MainActor-isolated via NSView
-    // and will crash with _checkExpectedExecutor when called from AppKit's layout
-    // path before any Swift Task has initialized the main-actor executor singleton.
-    // All drawing is done in OrbLayerDelegate.draw(layer:in:) instead.
+    @objc private func displayLinkFired() {
+        // Runs on main thread (CADisplayLink + RunLoop.main).
+        // setNeedsDisplay triggers OrbLayerDelegate.draw(layer:in:) synchronously
+        // within the CATransaction committed at the end of this run loop turn.
+        layer?.setNeedsDisplay()
+    }
+
+    // DO NOT override draw(_ dirtyRect:) — NSView.draw(_:) is @MainActor-isolated
+    // in Swift 6 and gets _checkExpectedExecutor injected by the compiler, which
+    // crashes when called before the main-actor executor singleton is initialized.
+    // All drawing is delegated to OrbLayerDelegate.draw(layer:in:) instead.
 }
 
 // MARK: - OrbLayerDelegate
 
-/// CALayerDelegate that performs all CoreGraphics rendering.
+/// `CALayerDelegate` that performs all CoreGraphics rendering.
 ///
-/// This class is a plain `NSObject` subclass — it does NOT inherit from `NSView`
-/// and is NOT `@MainActor`-isolated. The `draw(layer:in:)` method therefore does
-/// NOT get `_checkExpectedExecutor` injected by the Swift 6 compiler. It is safe
-/// to call from any thread context, including AppKit's layer rendering pipeline.
+/// This is a plain `NSObject` subclass, NOT a SwiftUI or `@MainActor`-isolated
+/// type. `CALayerDelegate.draw(layer:in:)` is defined in a plain Objective-C
+/// protocol — the Swift 6 compiler does NOT annotate it with `@MainActor` and
+/// does NOT inject `_checkExpectedExecutor` at its entry point.
+///
+/// Because `BirthOrbNSView` uses `CADisplayLink` scheduled on the main run loop,
+/// `draw(layer:in:)` is always called on the main thread. All state (`phase`,
+/// `isSpeaking`, `phaseStartTimes`) is therefore accessed exclusively on the main
+/// thread — there is no cross-thread access and no need for locks.
 final class OrbLayerDelegate: NSObject, CALayerDelegate {
 
-    // MARK: - State (written from main thread, read in draw)
+    // MARK: - State (main thread only)
 
+    /// Current birth phase — written by BirthOrbNSView on main thread, read in draw().
     var phase: BirthPhase = .dormant {
         didSet {
             let key = "\(phase)"
@@ -167,18 +160,20 @@ final class OrbLayerDelegate: NSObject, CALayerDelegate {
             }
         }
     }
+
+    /// Whether the coordinator is currently speaking — written and read on main thread.
     var isSpeaking: Bool = false
 
-    /// Back-reference to the hosted layer for triggering redraws from deinit / link.
+    /// Back-reference to the hosted layer for triggering redraws.
     weak var hostLayer: CALayer?
 
-    // MARK: - Private state
+    // MARK: - Private state (main thread only)
 
+    /// Start timestamp for each phase, keyed by phase description string.
     private var phaseStartTimes: [String: Double] = [:]
 
     override init() {
         super.init()
-        // Seed start time for the initial phase.
         phaseStartTimes["\(phase)"] = CACurrentMediaTime()
     }
 
@@ -186,23 +181,24 @@ final class OrbLayerDelegate: NSObject, CALayerDelegate {
 
     /// Called by CALayer when the layer needs to redraw.
     ///
-    /// This method is NOT `@MainActor`-isolated — it is defined in `CALayerDelegate`
-    /// (a plain protocol with no actor annotation). The Swift 6 compiler does NOT
-    /// inject `_checkExpectedExecutor` here. Safe to call from AppKit's rendering thread.
+    /// NOT `@MainActor`-isolated — `CALayerDelegate` is a plain protocol with no
+    /// actor annotation. The Swift 6 compiler does NOT inject `_checkExpectedExecutor`
+    /// here. Because `BirthOrbNSView` drives this via `CADisplayLink` on `RunLoop.main`,
+    /// this method always executes on the main thread.
     func draw(layer: CALayer, in ctx: CGContext) {
-        let t      = CACurrentMediaTime()
-        let w      = layer.bounds.width
-        let h      = layer.bounds.height
-        let cx     = w * 0.5
-        let cy     = h * 0.5
-        let R      = min(w, h) * 0.42
+        let t  = CACurrentMediaTime()
+        let w  = layer.bounds.width
+        let h  = layer.bounds.height
+        let cx = w * 0.5
+        let cy = h * 0.5
+        let R  = min(w, h) * 0.42
+
         let params = phaseParams(t: t)
+        guard params.coreAlpha > 0.001 else { return }
 
         let phaseKey   = "\(phase)"
         let phaseStart = phaseStartTimes[phaseKey] ?? t
         let phaseT     = t - phaseStart
-
-        guard params.coreAlpha > 0.001 else { return }
 
         // ── Breathing modifier for booting phase ──────────────────────────────
         var coreR = params.coreR
@@ -236,9 +232,9 @@ final class OrbLayerDelegate: NSObject, CALayerDelegate {
 
         if params.numSparks > 0 {
             drawSparks(ctx, t: t, cx: cx, cy: cy, R: R,
-                       numSparks: params.numSparks,
-                       sparkSpeed: params.sparkSpeed,
-                       sparkMaxR:  params.sparkMaxR)
+                       numSparks:   params.numSparks,
+                       sparkSpeed:  params.sparkSpeed,
+                       sparkMaxR:   params.sparkMaxR)
         }
 
         drawCore(ctx, cx: cx, cy: cy, radius: coreRadius,
@@ -307,7 +303,7 @@ final class OrbLayerDelegate: NSObject, CALayerDelegate {
     private static let flareAngles: [Double] = [0.0, 1.047, 2.094, 3.142, 4.189, 5.236]
     private static let flareCurves: [Double] = [0.30, -0.25, 0.40, -0.35, 0.28, -0.42]
 
-    // MARK: - Color helpers (plain CGColor — no actor isolation)
+    // MARK: - Color helpers
 
     private static func coldBlue(alpha: Double) -> CGColor {
         CGColor(red: 0.55, green: 0.72, blue: 1.00, alpha: alpha)
@@ -325,7 +321,6 @@ final class OrbLayerDelegate: NSObject, CALayerDelegate {
         CGColor(red: 1.00, green: 1.00, blue: 1.00, alpha: alpha)
     }
 
-    /// Blend two RGB triplets → CGColor. No actor isolation required.
     private static func lerpCG(
         _ ar: Double, _ ag: Double, _ ab: Double,
         _ br: Double, _ bg: Double, _ bb: Double,
@@ -369,8 +364,8 @@ final class OrbLayerDelegate: NSObject, CALayerDelegate {
                                         locations: locs) else { return }
 
         ctx.saveGState()
-        ctx.addEllipse(in: CGRect(x: cx-radius, y: cy-radius,
-                                   width: radius*2, height: radius*2))
+        ctx.addEllipse(in: CGRect(x: cx - radius, y: cy - radius,
+                                  width: radius * 2, height: radius * 2))
         ctx.clip()
         let c = CGPoint(x: cx, y: cy)
         ctx.drawRadialGradient(gradient, startCenter: c, startRadius: 0,
@@ -392,24 +387,24 @@ final class OrbLayerDelegate: NSObject, CALayerDelegate {
             let arcR      = radii[i] * R
             let tilt      = Self.arcTilts[i]
             let rotAngle  = (t / periods[i]) * .pi * 2.0
-            let arcLength = arcLengths[min(i, arcLengths.count-1)]
+            let arcLength = arcLengths[min(i, arcLengths.count - 1)]
 
             var eff = arcAlpha
             if isAwakening {
-                let noise = 0.5 + 0.5*sin(t*3.7 + Double(i)*2.3)
-                          + 0.3*sin(t*7.1 + Double(i)*1.1)
-                eff *= max(0.0, min(1.0, noise*0.6))
+                let noise = 0.5 + 0.5 * sin(t * 3.7 + Double(i) * 2.3)
+                          + 0.3 * sin(t * 7.1 + Double(i) * 1.1)
+                eff *= max(0.0, min(1.0, noise * 0.6))
             }
             guard eff > 0.01 else { continue }
 
-            let rx = arcR
-            let ry = arcR * cos(tilt)
-            let steps = max(24, Int(arcLength / (.pi*2) * 96))
+            let rx    = arcR
+            let ry    = arcR * cos(tilt)
+            let steps = max(24, Int(arcLength / (.pi * 2) * 96))
             var pts: [CGPoint] = []
             pts.reserveCapacity(steps + 1)
             for s in 0...steps {
                 let ang = rotAngle + arcLength * Double(s) / Double(steps)
-                pts.append(CGPoint(x: cx + rx*cos(ang), y: cy + ry*sin(ang)))
+                pts.append(CGPoint(x: cx + rx * cos(ang), y: cy + ry * sin(ang)))
             }
             guard pts.count >= 2 else { continue }
 
@@ -418,9 +413,9 @@ final class OrbLayerDelegate: NSObject, CALayerDelegate {
             for p in pts.dropFirst() { path.addLine(to: p) }
 
             for (color, width) in [
-                (Self.ambGlow(alpha: eff*0.25), CGFloat(4.0)),
-                (Self.ambCore(alpha: eff*0.75), CGFloat(1.5)),
-                (Self.ambHot(alpha:  eff*0.40), CGFloat(0.4))
+                (Self.ambGlow(alpha: eff * 0.25), CGFloat(4.0)),
+                (Self.ambCore(alpha: eff * 0.75), CGFloat(1.5)),
+                (Self.ambHot(alpha:  eff * 0.40), CGFloat(0.4))
             ] {
                 ctx.saveGState()
                 ctx.setStrokeColor(color)
@@ -442,7 +437,7 @@ final class OrbLayerDelegate: NSObject, CALayerDelegate {
         let maxFlares = (phase == .voiceReceived) ? 6 : 3
 
         for i in 0..<maxFlares {
-            let progress = (t/period + Double(i)/Double(maxFlares))
+            let progress = (t / period + Double(i) / Double(maxFlares))
                            .truncatingRemainder(dividingBy: 1.0)
             guard progress < dutyCycle else { continue }
             drawFlare(ctx, cx: cx, cy: cy,
@@ -455,12 +450,12 @@ final class OrbLayerDelegate: NSObject, CALayerDelegate {
 
         if phase == .voiceReceived && phaseT < 1.5 {
             for i in 0..<3 {
-                let eT = phaseT - Double(i)*0.1
+                let eT = phaseT - Double(i) * 0.1
                 guard eT >= 0 else { continue }
                 drawFlare(ctx, cx: cx, cy: cy,
                           angle:    Self.flareAngles[i] + 0.52,
-                          curve:    Self.flareCurves[(i+3) % Self.flareCurves.count],
-                          progress: min(1.0, eT/1.2),
+                          curve:    Self.flareCurves[(i + 3) % Self.flareCurves.count],
+                          progress: min(1.0, eT / 1.2),
                           maxLen:   params.flareMaxLen * R * 1.35,
                           alpha:    params.flareAlpha * 1.15)
             }
@@ -470,29 +465,29 @@ final class OrbLayerDelegate: NSObject, CALayerDelegate {
     private func drawFlare(_ ctx: CGContext, cx: Double, cy: Double,
                             angle: Double, curve: Double,
                             progress: Double, maxLen: Double, alpha: Double) {
-        let extFrac  = progress < 0.4 ? progress/0.4 : 1.0
-        let fadeFrac = progress < 0.4 ? 1.0 : pow(1.0-(progress-0.4)/0.6, 0.6)
+        let extFrac  = progress < 0.4 ? progress / 0.4 : 1.0
+        let fadeFrac = progress < 0.4 ? 1.0 : pow(1.0 - (progress - 0.4) / 0.6, 0.6)
         let ea       = alpha * extFrac * fadeFrac
         guard ea > 0.01 else { return }
 
-        let coreEdge = 0.06*(extFrac*0.3+0.7)
-        let startX = cx + cos(angle)*coreEdge*maxLen/0.55
-        let startY = cy + sin(angle)*coreEdge*maxLen/0.55
-        let tipX   = cx + cos(angle)*maxLen*extFrac
-        let tipY   = cy + sin(angle)*maxLen*extFrac
-        let perp   = angle + .pi/2.0
-        let cpX    = cx + cos(angle)*maxLen*extFrac*0.5 + cos(perp)*curve*maxLen
-        let cpY    = cy + sin(angle)*maxLen*extFrac*0.5 + sin(perp)*curve*maxLen
+        let coreEdge = 0.06 * (extFrac * 0.3 + 0.7)
+        let startX = cx + cos(angle) * coreEdge * maxLen / 0.55
+        let startY = cy + sin(angle) * coreEdge * maxLen / 0.55
+        let tipX   = cx + cos(angle) * maxLen * extFrac
+        let tipY   = cy + sin(angle) * maxLen * extFrac
+        let perp   = angle + .pi / 2.0
+        let cpX    = cx + cos(angle) * maxLen * extFrac * 0.5 + cos(perp) * curve * maxLen
+        let cpY    = cy + sin(angle) * maxLen * extFrac * 0.5 + sin(perp) * curve * maxLen
 
         let path = CGMutablePath()
         path.move(to: CGPoint(x: startX, y: startY))
-        path.addQuadCurve(to:    CGPoint(x: tipX, y: tipY),
-                          control: CGPoint(x: cpX,   y: cpY))
+        path.addQuadCurve(to:     CGPoint(x: tipX, y: tipY),
+                          control: CGPoint(x: cpX,  y: cpY))
 
         for (color, width) in [
-            (Self.ambGlow(alpha: ea*0.55), CGFloat(8.0)),
-            (Self.ambCore(alpha: ea*0.85), CGFloat(2.5)),
-            (Self.ambHot(alpha:  ea*0.60), CGFloat(0.6))
+            (Self.ambGlow(alpha: ea * 0.55), CGFloat(8.0)),
+            (Self.ambCore(alpha: ea * 0.85), CGFloat(2.5)),
+            (Self.ambHot(alpha:  ea * 0.60), CGFloat(0.6))
         ] {
             ctx.saveGState()
             ctx.setStrokeColor(color)
@@ -510,16 +505,16 @@ final class OrbLayerDelegate: NSObject, CALayerDelegate {
                             numSparks: Int, sparkSpeed: Double, sparkMaxR: Double) {
         for i in 0..<min(numSparks, Self.sparkAngles.count) {
             let angle    = Self.sparkAngles[i]
-            let progress = ((t/sparkSpeed) + Double(i)/Double(numSparks))
+            let progress = ((t / sparkSpeed) + Double(i) / Double(numSparks))
                            .truncatingRemainder(dividingBy: 1.0)
             let sa = sin(progress * .pi)
             guard sa > 0.01 else { continue }
 
-            let dist  = 0.06*R + progress*(sparkMaxR*R - 0.06*R)
+            let dist   = 0.06 * R + progress * (sparkMaxR * R - 0.06 * R)
             let wobble = sin(progress * .pi * 2.0) * 8.0
-            let perp   = angle + .pi/2.0
-            let px = cx + cos(angle)*dist + cos(perp)*wobble
-            let py = cy + sin(angle)*dist + sin(perp)*wobble
+            let perp   = angle + .pi / 2.0
+            let px = cx + cos(angle) * dist + cos(perp) * wobble
+            let py = cy + sin(angle) * dist + sin(perp) * wobble
 
             drawSpark(ctx, px: px, py: py, alpha: sa)
         }
@@ -531,8 +526,8 @@ final class OrbLayerDelegate: NSObject, CALayerDelegate {
 
         let colors: CFArray = [
             Self.white(alpha:  alpha),
-            Self.ambHot(alpha:  alpha*0.75),
-            Self.ambCore(alpha: alpha*0.30),
+            Self.ambHot(alpha:  alpha * 0.75),
+            Self.ambCore(alpha: alpha * 0.30),
             Self.ambGlow(alpha: 0.0)
         ] as CFArray
         let locs: [CGFloat] = [0.00, 0.35, 0.70, 1.00]
@@ -540,8 +535,8 @@ final class OrbLayerDelegate: NSObject, CALayerDelegate {
         if let g = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
                               colors: colors, locations: locs) {
             ctx.saveGState()
-            ctx.addEllipse(in: CGRect(x: px-outerR, y: py-outerR,
-                                      width: outerR*2, height: outerR*2))
+            ctx.addEllipse(in: CGRect(x: px - outerR, y: py - outerR,
+                                      width: outerR * 2, height: outerR * 2))
             ctx.clip()
             let c = CGPoint(x: px, y: py)
             ctx.drawRadialGradient(g, startCenter: c, startRadius: 0,
@@ -551,9 +546,9 @@ final class OrbLayerDelegate: NSObject, CALayerDelegate {
         }
 
         ctx.saveGState()
-        ctx.setFillColor(Self.white(alpha: alpha*0.90))
-        ctx.addEllipse(in: CGRect(x: px-innerR, y: py-innerR,
-                                   width: innerR*2, height: innerR*2))
+        ctx.setFillColor(Self.white(alpha: alpha * 0.90))
+        ctx.addEllipse(in: CGRect(x: px - innerR, y: py - innerR,
+                                  width: innerR * 2, height: innerR * 2))
         ctx.fillPath()
         ctx.restoreGState()
     }

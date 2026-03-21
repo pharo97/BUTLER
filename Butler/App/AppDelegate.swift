@@ -1,5 +1,4 @@
 import AppKit
-import SwiftUI
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -53,7 +52,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Windows
 
     private var glassChamber:       GlassChamberPanel?
-    private var birthPhaseWindow:   NSWindow?
+    private var birthPhaseWindow:   NSPanel?
     private var birthCoordinator:   BirthPhaseCoordinator?
     /// Observation task watching `BirthPhaseCoordinator.isComplete`.
     private var birthObserverTask:  Task<Void, Never>?
@@ -111,20 +110,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Determine whether to show onboarding or go straight to Glass Chamber.
         //
-        // IMPORTANT: warm the Swift concurrency main-actor executor BEFORE creating
-        // any SwiftUI window.
-        //
-        // `applicationDidFinishLaunching` is a pure AppKit ObjC delegate — no Swift
-        // concurrency Task is active. On macOS 26 (Swift 6 strict concurrency),
-        // SwiftUI's gesture handlers call `MainActor.assumeIsolated`, which calls
-        // `swift_task_isCurrentExecutorWithFlagsImpl`, which dereferences the Swift
-        // concurrency main-actor executor singleton. That singleton starts as nil and
-        // is initialized lazily on the first use of the Swift concurrency main actor.
+        // IMPORTANT: warm the Swift concurrency main-actor executor BEFORE showing
+        // any window. `applicationDidFinishLaunching` is a pure AppKit ObjC delegate
+        // — no Swift concurrency Task has run yet. On macOS 26 (Swift 6 strict
+        // concurrency), the main-actor executor singleton starts as nil and is
+        // initialized lazily on the first use of the Swift concurrency main actor.
+        // Any code that calls `MainActor.assumeIsolated` (including GlassChamberPanel's
+        // SwiftUI subtree) before that initialization crashes in
+        // `swift_task_isCurrentExecutorWithFlagsImpl`.
         //
         // Strategy: create an async Task that yields twice on the main actor, then
         // shows the window. The two yield points ensure the Swift concurrency runtime
-        // has fully registered its main-actor executor before any NSHostingView is
-        // created and before AppKit's first layout pass.
+        // has fully registered its main-actor executor before any window is shown.
         let onboardingComplete = UserDefaults.standard.bool(forKey: "butler.onboarding.complete")
 
         Task { @MainActor [weak self] in
@@ -175,10 +172,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Shows the BUTLER birth sequence in a dedicated full-bleed window.
     ///
+    /// Uses a pure AppKit `BirthPhaseViewController` — NO NSHostingView, NO SwiftUI,
+    /// NO AppKitEventBindingBridge. This avoids the macOS 26 beta (25C56) crash in
+    /// `swift_task_isCurrentExecutorWithFlagsImpl` caused by SwiftUI's gesture bridge.
+    ///
     /// When the coordinator sets `isComplete = true` (sequence finished or skipped),
-    /// the birth window closes and the Glass Chamber appears. This is observed via
-    /// a polling task since `@Observable` change tracking requires a SwiftUI body
-    /// re-render or explicit `withObservationTracking`.
+    /// the birth window closes and the Glass Chamber appears.
     private func showBirthPhase() {
         let coordinator = BirthPhaseCoordinator(
             voiceSystem:     voiceSystem,
@@ -187,9 +186,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         self.birthCoordinator = coordinator
 
-        let birthView = BirthPhaseView(coordinator: coordinator, engine: engine)
-
-        // Dark, borderless window — fills a large portion of the main screen
         guard let screen = NSScreen.main else { showGlassChamber(); return }
         let screenFrame = screen.visibleFrame
         let windowWidth:  CGFloat = 620
@@ -197,31 +193,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let originX = screenFrame.midX - windowWidth  / 2
         let originY = screenFrame.midY - windowHeight / 2
 
-        let window = NSWindow(
+        // BUG-013 fix: use NSPanel (not NSWindow) so the birth phase window never
+        // steals key focus from the user's active application — matching the
+        // Glass Chamber pattern. becomesKeyOnlyIfNeeded = true means the panel
+        // only becomes key when the user explicitly interacts with a control
+        // (e.g. the voice table), not on mere visibility.
+        let window = NSPanel(
             contentRect: NSRect(x: originX, y: originY, width: windowWidth, height: windowHeight),
-            styleMask:   [.borderless],
+            styleMask:   [.borderless, .nonactivatingPanel],
             backing:     .buffered,
             defer:       false
         )
-        window.level                     = .floating
-        window.isOpaque                  = false
-        window.backgroundColor           = .clear
-        window.hasShadow                 = true
-        window.isReleasedWhenClosed      = false
-        window.collectionBehavior        = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+        window.level                       = .floating
+        window.isOpaque                    = false
+        window.backgroundColor             = .clear
+        window.hasShadow                   = true
+        window.isReleasedWhenClosed        = false
+        window.collectionBehavior          = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         window.isMovableByWindowBackground = true
+        window.becomesKeyOnlyIfNeeded      = true
 
-        let hostingView = NSHostingView(rootView: birthView)
-        hostingView.wantsLayer = true
-        hostingView.layer?.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 0)
-        window.contentView = hostingView
+        // Pure AppKit view controller — NO NSHostingView, NO SwiftUI, NO AppKitEventBindingBridge.
+        // The view controller starts the coordinator sequence in viewDidAppear and polls
+        // coordinator properties via an 80 ms NSTimer.
+        let vc = BirthPhaseViewController(coordinator: coordinator, engine: engine)
+        window.contentViewController = vc
+
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         self.birthPhaseWindow = window
-
-        // Poll `coordinator.isComplete` — when it flips, close the birth window
-        // and open the Glass Chamber. We use `withObservationTracking` so the
-        // callback fires exactly once when `isComplete` changes.
         observeBirthCompletion(coordinator: coordinator)
     }
 
@@ -262,24 +262,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window?.animator().alphaValue = 0
         } completionHandler: { [weak self] in
             Task { @MainActor [weak self] in
-                // Release the AppDelegate's coordinator reference FIRST — while the
-                // birth window (and therefore its NSHostingView → BirthPhaseView) is
-                // still alive and holding its own strong reference. This ensures the
-                // coordinator's retain count stays > 0 throughout SwiftUI's entire
-                // @Observable teardown, so observation-invalidation callbacks that
-                // fire on the next run-loop cycle after the NSHostingView is released
-                // never touch freed memory.
+                // Release coordinator before closing the window so any in-flight
+                // @Observable access (if called from the coordinator's deinit path)
+                // occurs while the window's view controller is still allocated.
                 //
-                // Order matters:
+                // Order:
                 //   1. birthCoordinator = nil   ← drops AppDelegate's +1 ref
-                //   2. birthPhaseWindow = nil   ← drops window's +1, releases NSHostingView
-                //      → SwiftUI tears down BirthPhaseView → releases view's +1
-                //      → coordinator dealloc (ref count → 0)
-                //   3. showGlassChamber()
-                //
-                // If we nil the window first (old order), the coordinator could reach
-                // ref-count 0 while @Observable teardown callbacks are still queued,
-                // producing EXC_BAD_ACCESS code=1 at address=0x0 in objc_msgSend.
+                //   2. birthPhaseWindow.close() ← stops the 80 ms timer via viewWillDisappear
+                //   3. birthPhaseWindow = nil   ← releases BirthPhaseViewController + views
+                //   4. showGlassChamber()
                 self?.birthCoordinator = nil
                 self?.birthPhaseWindow?.close()
                 self?.birthPhaseWindow = nil

@@ -226,9 +226,24 @@ final class BirthPhaseCoordinator {
         // Poll until voiceWasSelected() is called from the UI.
         // Using a simple bool + sleep loop avoids the PAC/JIT crash that occurs on
         // macOS 26 when CheckedContinuation.resume() fires during @Observable + WKWebView re-render.
+        // BUG-007 fix: 30-second timeout so the gate cannot block forever if the user
+        // does not interact with the voice picker (e.g. window hidden, accessibility bypass).
         voiceHasBeenSelected = false
+        let voiceGateDeadline = CACurrentMediaTime() + 30.0
         while !voiceHasBeenSelected {
             guard !Task.isCancelled else { return }
+            if CACurrentMediaTime() >= voiceGateDeadline {
+                // Timeout: fall back to the system default English voice so the sequence
+                // can continue rather than hanging indefinitely.
+                if UserDefaults.standard.string(forKey: "butler.tts.voiceIdentifier") == nil {
+                    let fallback = AVSpeechSynthesisVoice(language: "en-US")
+                    if let id = fallback?.identifier {
+                        UserDefaults.standard.set(id, forKey: "butler.tts.voiceIdentifier")
+                        UserDefaults.standard.set(id, forKey: "butler.selectedVoiceIdentifier.v1")
+                    }
+                }
+                break
+            }
             try? await Task.sleep(for: .milliseconds(100))
         }
         guard !Task.isCancelled else { return }
@@ -418,6 +433,18 @@ final class BirthPhaseCoordinator {
         utterance.postUtteranceDelay = 0.05
 
         glitchSynth.speak(utterance)
+
+        // BUG-008 fix: AVSpeechSynthesizer.isSpeaking is false for a brief window
+        // after speak() returns while the synthesizer initialises internally.
+        // Polling immediately after speak() therefore exits the loop on the very first
+        // iteration for short utterances (< ~200 ms). Spin until isSpeaking goes true
+        // before entering the main wait loop, capping at 500 ms to avoid infinite wait
+        // if the synthesizer fails to start (e.g. no audio output device).
+        let startDeadline = CACurrentMediaTime() + 0.5
+        while !glitchSynth.isSpeaking && !Task.isCancelled {
+            if CACurrentMediaTime() >= startDeadline { break }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
 
         // Poll until AVSpeechSynthesizer finishes — no delegate, no continuation.
         while glitchSynth.isSpeaking {
