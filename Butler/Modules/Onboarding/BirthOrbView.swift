@@ -1,5 +1,6 @@
 import AppKit
 import QuartzCore
+import SwiftUI
 
 // MARK: - BirthOrbView (NSViewRepresentable bridge)
 
@@ -8,25 +9,27 @@ import QuartzCore
 /// ## Rendering architecture
 ///
 /// All animation state lives in `BirthOrbNSView` and `OrbLayerDelegate`, both
-/// accessed exclusively on the main thread via `CADisplayLink`. There are no raw
+/// accessed exclusively on the main thread via a 60 fps `NSTimer`. There are no raw
 /// C callbacks, no `CVDisplayLink`, no cross-thread state reads.
 ///
-/// `OrbLayerDelegate.draw(layer:in:)` is a `CALayerDelegate` method — the Swift
+/// `OrbLayerDelegate.draw(_:in:)` is a `CALayerDelegate` method — the Swift
 /// compiler does NOT inject `@MainActor` executor checks there, avoiding the
 /// `swift_task_isCurrentExecutorWithFlagsImpl` crash that fires when AppKit's
 /// layer-rendering pipeline calls an `@MainActor`-isolated `draw(_:)` override
 /// before any Swift `Task` has initialized the main-actor executor singleton.
 ///
-/// ## Why not CVDisplayLink?
+/// ## Why NSTimer instead of CVDisplayLink?
 ///
 /// `CVDisplayLink` fires its callback on a private display thread. Any state
 /// written on the main thread (phase, isSpeaking) and read on the display thread
 /// is a data race under Swift 6 strict concurrency — and a latent use-after-free
 /// if `Unmanaged.passRetained` is not balanced with a corresponding release before
-/// `deinit` completes. `CADisplayLink` fires on the main run loop at display
-/// refresh rate, eliminating all cross-thread access.
-import SwiftUI
-
+/// `deinit` completes.
+///
+/// `NSTimer` scheduled on `RunLoop.main` in `.common` mode fires on the main thread
+/// at the specified interval. At 60 fps the interval is 1/60 ≈ 16.7 ms. All state
+/// reads and writes are on the main thread, eliminating the race entirely.
+/// `CADisplayLink` is iOS-only and unavailable on macOS.
 struct BirthOrbView: NSViewRepresentable {
 
     var phase:      BirthPhase
@@ -47,11 +50,11 @@ struct BirthOrbView: NSViewRepresentable {
 
 // MARK: - BirthOrbNSView
 
-/// `NSView` container that drives the orb animation via `CADisplayLink`.
+/// `NSView` container that drives the orb animation via a 60 fps `NSTimer`.
 ///
-/// All state mutations and all rendering occur on the main thread — `CADisplayLink`
-/// is scheduled on `RunLoop.main` and fires its selector on `@MainActor`.
-/// No raw C callback, no `Unmanaged` retain/release bookkeeping.
+/// All state mutations and all rendering occur on the main thread — `NSTimer` is
+/// scheduled on `RunLoop.main` and fires its selector on the main thread.
+/// No raw C callback, no `Unmanaged` retain/release bookkeeping, no cross-thread access.
 @MainActor
 final class BirthOrbNSView: NSView {
 
@@ -68,36 +71,38 @@ final class BirthOrbNSView: NSView {
 
     private let orbDelegate = OrbLayerDelegate()
 
-    /// `CADisplayLink` fires on the main run loop — no threading contract to uphold.
-    private var displayLink: CADisplayLink?
+    /// 60 fps timer — fires on main run loop, no cross-thread access.
+    /// `nonisolated(unsafe)` because deinit is nonisolated in Swift 6 but
+    /// NSTimer.invalidate() is documented as safe to call from any thread.
+    nonisolated(unsafe) private var displayTimer: Timer?
 
     // MARK: - Setup
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         setupLayer()
-        startDisplayLink()
+        startDisplayTimer()
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         setupLayer()
-        startDisplayLink()
+        startDisplayTimer()
     }
 
     deinit {
-        // CADisplayLink invalidation is safe from deinit because the target is
-        // `self` (held weakly by CADisplayLink internally), and invalidate() is
-        // documented to be callable from any thread.
-        displayLink?.invalidate()
-        displayLink = nil
+        // Timer invalidation is safe from nonisolated deinit: NSTimer.invalidate()
+        // is documented as callable from any thread, and the timer target is self
+        // via a weak reference in the closure capture.
+        displayTimer?.invalidate()
+        displayTimer = nil
     }
 
     private func setupLayer() {
         wantsLayer = true
-        layer?.delegate   = orbDelegate
+        layer?.delegate        = orbDelegate
         layer?.backgroundColor = CGColor.clear
-        layer?.contentsScale = (window?.backingScaleFactor)
+        layer?.contentsScale   = (window?.backingScaleFactor)
             ?? NSScreen.main?.backingScaleFactor
             ?? 2.0
     }
@@ -109,29 +114,31 @@ final class BirthOrbNSView: NSView {
             ?? 2.0
     }
 
-    // MARK: - CADisplayLink
+    // MARK: - Display timer
 
-    private func startDisplayLink() {
-        // CADisplayLink fires its selector on the run loop it was added to.
-        // Adding to .main means the selector always runs on the main thread —
-        // the same thread that owns all BirthOrbNSView and OrbLayerDelegate state.
-        let link = CADisplayLink(target: self, selector: #selector(displayLinkFired))
-        link.add(to: .main, forMode: .common)
-        self.displayLink = link
+    private func startDisplayTimer() {
+        // Interval: 1/60 s ≈ 16.7 ms. RunLoop.main + .common mode ensures the timer
+        // fires even when AppKit runs the run loop in event-tracking mode (e.g. while
+        // the user is interacting with the voice picker table).
+        let timer = Timer(timeInterval: 1.0 / 60.0,
+                          repeats: true) { [weak self] _ in
+            // Closure is called on main thread (Timer + RunLoop.main).
+            self?.tickDisplay()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        displayTimer = timer
         orbDelegate.hostLayer = layer
     }
 
-    @objc private func displayLinkFired() {
-        // Runs on main thread (CADisplayLink + RunLoop.main).
-        // setNeedsDisplay triggers OrbLayerDelegate.draw(layer:in:) synchronously
-        // within the CATransaction committed at the end of this run loop turn.
+    private func tickDisplay() {
+        // Main thread only (RunLoop.main timer closure).
         layer?.setNeedsDisplay()
     }
 
     // DO NOT override draw(_ dirtyRect:) — NSView.draw(_:) is @MainActor-isolated
     // in Swift 6 and gets _checkExpectedExecutor injected by the compiler, which
     // crashes when called before the main-actor executor singleton is initialized.
-    // All drawing is delegated to OrbLayerDelegate.draw(layer:in:) instead.
+    // All drawing is delegated to OrbLayerDelegate.draw(_:in:) instead.
 }
 
 // MARK: - OrbLayerDelegate
@@ -139,19 +146,19 @@ final class BirthOrbNSView: NSView {
 /// `CALayerDelegate` that performs all CoreGraphics rendering.
 ///
 /// This is a plain `NSObject` subclass, NOT a SwiftUI or `@MainActor`-isolated
-/// type. `CALayerDelegate.draw(layer:in:)` is defined in a plain Objective-C
+/// type. `CALayerDelegate.draw(_:in:)` is defined in a plain Objective-C
 /// protocol — the Swift 6 compiler does NOT annotate it with `@MainActor` and
 /// does NOT inject `_checkExpectedExecutor` at its entry point.
 ///
-/// Because `BirthOrbNSView` uses `CADisplayLink` scheduled on the main run loop,
-/// `draw(layer:in:)` is always called on the main thread. All state (`phase`,
+/// Because `BirthOrbNSView` uses an `NSTimer` scheduled on the main run loop,
+/// `draw(_:in:)` is always called on the main thread. All state (`phase`,
 /// `isSpeaking`, `phaseStartTimes`) is therefore accessed exclusively on the main
 /// thread — there is no cross-thread access and no need for locks.
 final class OrbLayerDelegate: NSObject, CALayerDelegate {
 
     // MARK: - State (main thread only)
 
-    /// Current birth phase — written by BirthOrbNSView on main thread, read in draw().
+    /// Current birth phase — written by BirthOrbNSView on main thread, read in draw(_:in:).
     var phase: BirthPhase = .dormant {
         didSet {
             let key = "\(phase)"
@@ -183,9 +190,9 @@ final class OrbLayerDelegate: NSObject, CALayerDelegate {
     ///
     /// NOT `@MainActor`-isolated — `CALayerDelegate` is a plain protocol with no
     /// actor annotation. The Swift 6 compiler does NOT inject `_checkExpectedExecutor`
-    /// here. Because `BirthOrbNSView` drives this via `CADisplayLink` on `RunLoop.main`,
+    /// here. Because `BirthOrbNSView` drives this via `NSTimer` on `RunLoop.main`,
     /// this method always executes on the main thread.
-    func draw(layer: CALayer, in ctx: CGContext) {
+    func draw(_ layer: CALayer, in ctx: CGContext) {
         let t  = CACurrentMediaTime()
         let w  = layer.bounds.width
         let h  = layer.bounds.height
@@ -305,20 +312,49 @@ final class OrbLayerDelegate: NSObject, CALayerDelegate {
 
     // MARK: - Color helpers
 
-    private static func coldBlue(alpha: Double) -> CGColor {
-        CGColor(red: 0.55, green: 0.72, blue: 1.00, alpha: alpha)
+    // BUG-B1 fix: two palettes per PRD.
+    // Cold palette  — dormant, booting, digitalAwakening (phases 0–2)
+    // Warm palette  — voiceReceived (phase 3) surge on chime
+
+    // --- Cold (ice-blue) palette ---
+    private static func coldGlow(alpha: Double) -> CGColor {
+        CGColor(red: 0.20, green: 0.40, blue: 0.90, alpha: alpha)  // deep blue
     }
+    private static func coldCore(alpha: Double) -> CGColor {
+        CGColor(red: 0.30, green: 0.55, blue: 1.00, alpha: alpha)  // ice blue
+    }
+    private static func coldHot(alpha: Double) -> CGColor {
+        CGColor(red: 0.50, green: 0.70, blue: 1.00, alpha: alpha)  // bright blue-white
+    }
+
+    // --- Warm (amber/gold) palette — voiceReceived surge only ---
     private static func ambGlow(alpha: Double) -> CGColor {
-        CGColor(red: 1.00, green: 0.56, blue: 0.00, alpha: alpha)
+        CGColor(red: 1.00, green: 0.40, blue: 0.00, alpha: alpha)  // orange
     }
     private static func ambCore(alpha: Double) -> CGColor {
-        CGColor(red: 1.00, green: 0.70, blue: 0.00, alpha: alpha)
+        CGColor(red: 1.00, green: 0.70, blue: 0.00, alpha: alpha)  // amber
     }
     private static func ambHot(alpha: Double) -> CGColor {
-        CGColor(red: 1.00, green: 0.84, blue: 0.31, alpha: alpha)
+        CGColor(red: 1.00, green: 0.90, blue: 0.50, alpha: alpha)  // gold-white
     }
+
     private static func white(alpha: Double) -> CGColor {
         CGColor(red: 1.00, green: 1.00, blue: 1.00, alpha: alpha)
+    }
+
+    /// Returns true when the warm (amber/gold) palette should be used.
+    /// Only `.voiceReceived` uses the surge palette; all earlier phases use cold-blue.
+    private var isWarmPhase: Bool { phase == .voiceReceived }
+
+    // Phase-aware color accessors — route to the appropriate static palette.
+    private func glowColor(alpha: Double) -> CGColor {
+        isWarmPhase ? Self.ambGlow(alpha: alpha) : Self.coldGlow(alpha: alpha)
+    }
+    private func coreColor(alpha: Double) -> CGColor {
+        isWarmPhase ? Self.ambCore(alpha: alpha) : Self.coldCore(alpha: alpha)
+    }
+    private func hotColor(alpha: Double) -> CGColor {
+        isWarmPhase ? Self.ambHot(alpha: alpha) : Self.coldHot(alpha: alpha)
     }
 
     private static func lerpCG(
@@ -327,9 +363,9 @@ final class OrbLayerDelegate: NSObject, CALayerDelegate {
         t: Double, alpha: Double
     ) -> CGColor {
         let f = max(0.0, min(1.0, t))
-        return CGColor(red:   ar*(1-f)+br*f,
-                       green: ag*(1-f)+bg*f,
-                       blue:  ab*(1-f)+bb*f,
+        return CGColor(red:   ar * (1 - f) + br * f,
+                       green: ag * (1 - f) + bg * f,
+                       blue:  ab * (1 - f) + bb * f,
                        alpha: alpha)
     }
 
@@ -341,22 +377,45 @@ final class OrbLayerDelegate: NSObject, CALayerDelegate {
 
         let clamped = max(0.0, min(1.0, hot))
 
+        // BUG-B1 fix: gradient endpoints are drawn from the phase-aware palette.
+        // Cold phases: blue-white core fading to deep blue glow.
+        // Warm phase (voiceReceived): amber-white core fading to orange glow.
         let innerColor: CGColor
-        if clamped < 0.6 {
-            innerColor = Self.lerpCG(0.55, 0.72, 1.00,
-                                     1.00, 0.84, 0.31,
-                                     t: clamped / 0.6, alpha: alpha)
-        } else {
-            innerColor = Self.lerpCG(1.00, 0.84, 0.31,
-                                     1.00, 1.00, 1.00,
-                                     t: (clamped - 0.6) / 0.4, alpha: alpha)
-        }
-        let outerColor = Self.lerpCG(0.55, 0.72, 1.00,
-                                     1.00, 0.56, 0.00,
-                                     t: min(1.0, clamped * 1.5),
-                                     alpha: alpha * 0.55)
+        let midColor:   CGColor
 
-        let colors: CFArray = [innerColor, outerColor, Self.ambGlow(alpha: 0.0)] as CFArray
+        if isWarmPhase {
+            // Warm: amber (ambCore) → gold-white (ambHot) at extreme heat
+            if clamped < 0.6 {
+                innerColor = Self.lerpCG(1.00, 0.70, 0.00,
+                                         1.00, 0.90, 0.50,
+                                         t: clamped / 0.6, alpha: alpha)
+            } else {
+                innerColor = Self.lerpCG(1.00, 0.90, 0.50,
+                                         1.00, 1.00, 1.00,
+                                         t: (clamped - 0.6) / 0.4, alpha: alpha)
+            }
+            midColor = Self.lerpCG(1.00, 0.70, 0.00,
+                                   1.00, 0.40, 0.00,
+                                   t: min(1.0, clamped * 1.5),
+                                   alpha: alpha * 0.55)
+        } else {
+            // Cold: ice-blue (coldCore) → bright blue-white (coldHot) at high heat
+            if clamped < 0.6 {
+                innerColor = Self.lerpCG(0.30, 0.55, 1.00,
+                                         0.50, 0.70, 1.00,
+                                         t: clamped / 0.6, alpha: alpha)
+            } else {
+                innerColor = Self.lerpCG(0.50, 0.70, 1.00,
+                                         1.00, 1.00, 1.00,
+                                         t: (clamped - 0.6) / 0.4, alpha: alpha)
+            }
+            midColor = Self.lerpCG(0.30, 0.55, 1.00,
+                                   0.20, 0.40, 0.90,
+                                   t: min(1.0, clamped * 1.5),
+                                   alpha: alpha * 0.55)
+        }
+
+        let colors: CFArray = [innerColor, midColor, glowColor(alpha: 0.0)] as CFArray
         let locs: [CGFloat] = [0.00, 0.55, 1.00]
 
         guard let gradient = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
@@ -412,10 +471,12 @@ final class OrbLayerDelegate: NSObject, CALayerDelegate {
             path.move(to: pts[0])
             for p in pts.dropFirst() { path.addLine(to: p) }
 
+            // BUG-B1 fix: use phase-aware color accessors so arcs are cold-blue
+            // for phases 0–2 and amber/gold for voiceReceived.
             for (color, width) in [
-                (Self.ambGlow(alpha: eff * 0.25), CGFloat(4.0)),
-                (Self.ambCore(alpha: eff * 0.75), CGFloat(1.5)),
-                (Self.ambHot(alpha:  eff * 0.40), CGFloat(0.4))
+                (glowColor(alpha: eff * 0.25), CGFloat(4.0)),
+                (coreColor(alpha: eff * 0.75), CGFloat(1.5)),
+                (hotColor(alpha:  eff * 0.40), CGFloat(0.4))
             ] {
                 ctx.saveGState()
                 ctx.setStrokeColor(color)
@@ -484,10 +545,11 @@ final class OrbLayerDelegate: NSObject, CALayerDelegate {
         path.addQuadCurve(to:     CGPoint(x: tipX, y: tipY),
                           control: CGPoint(x: cpX,  y: cpY))
 
+        // BUG-B1 fix: phase-aware colors for flares.
         for (color, width) in [
-            (Self.ambGlow(alpha: ea * 0.55), CGFloat(8.0)),
-            (Self.ambCore(alpha: ea * 0.85), CGFloat(2.5)),
-            (Self.ambHot(alpha:  ea * 0.60), CGFloat(0.6))
+            (glowColor(alpha: ea * 0.55), CGFloat(8.0)),
+            (coreColor(alpha: ea * 0.85), CGFloat(2.5)),
+            (hotColor(alpha:  ea * 0.60), CGFloat(0.6))
         ] {
             ctx.saveGState()
             ctx.setStrokeColor(color)
@@ -524,11 +586,12 @@ final class OrbLayerDelegate: NSObject, CALayerDelegate {
         let outerR = 8.0
         let innerR = 3.0
 
+        // BUG-B1 fix: spark gradient uses phase-aware palette.
         let colors: CFArray = [
             Self.white(alpha:  alpha),
-            Self.ambHot(alpha:  alpha * 0.75),
-            Self.ambCore(alpha: alpha * 0.30),
-            Self.ambGlow(alpha: 0.0)
+            hotColor(alpha:  alpha * 0.75),
+            coreColor(alpha: alpha * 0.30),
+            glowColor(alpha: 0.0)
         ] as CFArray
         let locs: [CGFloat] = [0.00, 0.35, 0.70, 1.00]
 

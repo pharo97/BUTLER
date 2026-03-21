@@ -303,8 +303,9 @@ final class BirthPhaseCoordinator {
 
             butlerSpeechLine = qa.prompt
             isSpeakingNow    = true
+            // BUG-NEW-007 fix: defer reset so cancellation cannot leave isSpeakingNow = true.
+            defer { isSpeakingNow = false }
             await voiceSystem.speak(qa.prompt)
-            isSpeakingNow    = false
             guard !Task.isCancelled else { return }
 
             isListeningForAnswer = true
@@ -334,8 +335,9 @@ final class BirthPhaseCoordinator {
             guard !Task.isCancelled else { return }
             butlerSpeechLine = line
             isSpeakingNow    = true
+            // BUG-NEW-008 fix: defer reset so cancellation cannot leave isSpeakingNow = true.
+            defer { isSpeakingNow = false }
             await voiceSystem.speak(line)
-            isSpeakingNow    = false
             try? await Task.sleep(for: .milliseconds(500))
         }
 
@@ -475,8 +477,9 @@ final class BirthPhaseCoordinator {
 
         switch key {
         case "name":
+            // BUG-F2 fix: PRD spec for Q1 only defines UserDefaults["butler.user.name"].
+            // The extra MemoryWriter(.personal) write is not in spec — removed.
             UserDefaults.standard.set(answer, forKey: "butler.user.name")
-            MemoryWriter.shared.appendFact("User's name: \(answer)", to: .personal)
             print("[BirthPhase] Name set: \(answer)")
 
         case "role":

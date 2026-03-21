@@ -16,11 +16,11 @@ import WebKit
 ///
 /// This controller uses:
 /// - NSVisualEffectView for glass background
-/// - BirthOrbNSView (CALayerDelegate / CVDisplayLink) for phases dormant–voiceReceived
+/// - BirthOrbNSView (CALayerDelegate / NSTimer (RunLoop.main, .common mode)) for phases dormant–voiceReceived
 /// - WKWebView for the WebGL pulse orb in phases discovery–complete
 /// - NSTableView with pure ObjC target/action for voice selection
 /// - NSTextField for all text display
-/// - An 80 ms NSTimer to poll coordinator state (no @Observable, no withObservationTracking)
+/// - An 80 ms NSTimer on RunLoop.main .common mode to poll coordinator state (no @Observable, no withObservationTracking)
 ///
 /// Result: zero AppKitEventBindingBridge involvement, zero SwiftUI AttributeGraph
 /// executor checks, deterministic crash eliminated.
@@ -42,6 +42,7 @@ final class BirthPhaseViewController: NSViewController {
     private var voiceTableView: NSTableView!
     private var micIndicatorView: NSView!
     private var skipButton: NSButton!
+    private var subtitleLabel: NSTextField!
 
     // MARK: - State
 
@@ -54,6 +55,7 @@ final class BirthPhaseViewController: NSViewController {
     private var lastDisplayText: String = ""
     private var micPulseTimer: Timer?
     private var lastSpeakingState: Bool? = nil
+    private var lastWebGLState: String = ""
 
     // MARK: - Init
 
@@ -130,8 +132,11 @@ final class BirthPhaseViewController: NSViewController {
         view.addSubview(skipButton)
 
         // ── Orb container (centered horizontally: (620-280)/2 = 170) ───────────
+        // BUG-A1 fix: start hidden — PRD requires orb invisible during dormant (Phase 0).
+        // handlePhaseTransition(.booting) will reveal it when the phase advances.
         orbContainerView = NSView(frame: NSRect(x: 170, y: 340, width: 280, height: 280))
         orbContainerView.wantsLayer = true
+        orbContainerView.isHidden = true
         view.addSubview(orbContainerView)
 
         // BirthOrbNSView — phases dormant through voiceReceived
@@ -140,9 +145,12 @@ final class BirthPhaseViewController: NSViewController {
         orbContainerView.addSubview(birthOrbView)
 
         // WKWebView — phases discovery through complete
+        // BUG-014 fix: removed `config.preferences.setValue(true, forKey: "allowFileAccessFromFileURLs")`.
+        // That key is a private API on WKPreferences and was rejected during App Store review.
+        // `loadFileURL(_:allowingReadAccessTo:)` (called below) already grants the WKWebView
+        // read access to the directory containing pulse.html and its assets — no private KVC needed.
         let config = WKWebViewConfiguration()
         config.suppressesIncrementalRendering = true
-        config.preferences.setValue(true, forKey: "allowFileAccessFromFileURLs")
         pulseWebView = WKWebView(frame: orbContainerView.bounds, configuration: config)
         pulseWebView.autoresizingMask = [.width, .height]
         pulseWebView.setValue(false, forKey: "drawsBackground")
@@ -190,6 +198,20 @@ final class BirthPhaseViewController: NSViewController {
         voiceTableScrollView.isHidden = true
         view.addSubview(voiceTableScrollView)
 
+        // ── Subtitle label (speech / question text) ─────────────────────────────
+        // Positioned below the orb container (orb sits at y=340; subtitle at y=300).
+        subtitleLabel = NSTextField(wrappingLabelWithString: "")
+        subtitleLabel.frame = NSRect(x: 60, y: 300, width: 500, height: 36)
+        subtitleLabel.textColor = NSColor.white.withAlphaComponent(0.72)
+        subtitleLabel.backgroundColor = .clear
+        subtitleLabel.drawsBackground = false
+        subtitleLabel.isBezeled = false
+        subtitleLabel.isEditable = false
+        subtitleLabel.alignment = .center
+        subtitleLabel.font = NSFont.systemFont(ofSize: 14, weight: .light)
+        subtitleLabel.isHidden = true
+        view.addSubview(subtitleLabel)
+
         // ── Mic indicator (pulsing red dot during questioning) ──────────────────
         micIndicatorView = NSView(frame: NSRect(x: 290, y: 140, width: 40, height: 40))
         micIndicatorView.wantsLayer = true
@@ -202,9 +224,13 @@ final class BirthPhaseViewController: NSViewController {
     // MARK: - Update Timer
 
     private func startUpdateTimer() {
-        updateTimer = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { [weak self] _ in
+        // BUG-NEW-002 fix: use .common mode so the timer fires even while NSTableView
+        // scroll tracking is active (which parks the default run-loop mode).
+        let t = Timer(timeInterval: 0.08, repeats: true) { [weak self] _ in
             self?.syncUI()
         }
+        RunLoop.main.add(t, forMode: .common)
+        updateTimer = t
     }
 
     private func stopUpdateTimer() {
@@ -217,11 +243,13 @@ final class BirthPhaseViewController: NSViewController {
     /// Polls coordinator state every 80 ms and updates views directly.
     /// No @Observable, no withObservationTracking, no SwiftUI.
     @objc private func syncUI() {
-        let phase       = coordinator.phase
-        let bootText    = coordinator.bootText
-        let displayText = coordinator.displayText
-        let isSpeaking  = coordinator.isSpeakingNow
-        let isListening = coordinator.isListeningForAnswer
+        let phase           = coordinator.phase
+        let bootText        = coordinator.bootText
+        let displayText     = coordinator.displayText
+        let speechLine      = coordinator.butlerSpeechLine
+        let questionText    = coordinator.questionText
+        let isSpeaking      = coordinator.isSpeakingNow
+        let isListening     = coordinator.isListeningForAnswer
 
         // Phase transition
         if phase != lastPhase {
@@ -240,14 +268,51 @@ final class BirthPhaseViewController: NSViewController {
             lastDisplayText = displayText
         }
 
+        // BUG-NEW-004 fix: update subtitle label from coordinator speech state.
+        // Subtitle shows the current spoken/question text so the user can read
+        // what BUTLER is saying or asking.
+        switch phase {
+        case .booting:
+            subtitleLabel.isHidden = true
+
+        case .digitalAwakening:
+            subtitleLabel.isHidden = false
+            if subtitleLabel.stringValue != displayText {
+                subtitleLabel.stringValue = displayText
+            }
+
+        case .voiceReceived, .discovery, .declaring:
+            subtitleLabel.isHidden = speechLine.isEmpty
+            if subtitleLabel.stringValue != speechLine {
+                subtitleLabel.stringValue = speechLine
+            }
+
+        case .questioning:
+            // Show the current question above the mic indicator;
+            // use butlerSpeechLine as the active spoken subtitle when speaking.
+            let text = isSpeaking ? speechLine : questionText
+            subtitleLabel.isHidden = text.isEmpty
+            if subtitleLabel.stringValue != text {
+                subtitleLabel.stringValue = text
+            }
+
+        default:
+            subtitleLabel.isHidden = true
+        }
+
         // Mic indicator visibility is driven by isListening flag
         if phase == .questioning {
             micIndicatorView.isHidden = !isListening
         }
 
-        // Orb state for WebGL phases (discovery onward)
+        // Orb state for WebGL phases (discovery onward).
+        // BUG-D1/M1/D2 fix: pass all three state flags so PulseWebView can emit
+        // listening(0.5) during user answer turns and thinking(0.3) during the
+        // 1-second discovery thinking window (coordinator.phase == .discovery &&
+        // !isSpeaking covers the window before isSpeakingNow is set to true).
         if phaseRank(phase) >= phaseRank(.discovery) {
-            updatePulseWebView(isSpeaking: isSpeaking)
+            let isThinking = (coordinator.phase == .discovery && !isSpeaking && !isListening)
+            updatePulseWebView(isSpeaking: isSpeaking, isListening: isListening, isThinking: isThinking)
         }
 
         // Keep BirthOrbNSView in sync for pre-discovery phases
@@ -265,7 +330,10 @@ final class BirthPhaseViewController: NSViewController {
     ) {
         switch phase {
         case .dormant:
-            birthOrbView.isHidden = false
+            // BUG-A1 fix: PRD requires the orb to be INVISIBLE during Phase 0 (dormant).
+            // Hide the entire orbContainerView so neither BirthOrbNSView nor pulseWebView
+            // are visible. orbContainerView starts hidden by default (set in buildUI).
+            orbContainerView.isHidden = true
             pulseWebView.isHidden = true
             voiceTableScrollView.isHidden = true
             micIndicatorView.isHidden = true
@@ -274,6 +342,8 @@ final class BirthPhaseViewController: NSViewController {
             birthOrbView.orbIsSpeaking = false
 
         case .booting:
+            // BUG-A1 fix: reveal the orb container on Phase 1 entry (was hidden during dormant).
+            orbContainerView.isHidden = false
             textLabel.isHidden = false
             textLabel.font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
             birthOrbView.orbPhase = .booting
@@ -296,9 +366,16 @@ final class BirthPhaseViewController: NSViewController {
             birthOrbView.isHidden = true
             pulseWebView.isHidden = false
             micIndicatorView.isHidden = true
-            lastSpeakingState = nil   // force a JS call on next sync
+            lastWebGLState = ""   // BUG-D1 fix: force a JS call on next syncUI tick
+            // BUG-NEW-005 fix: tell the WebGL orb to exit birth mode now that the
+            // orb is fully formed and we are using the normal setState() path.
+            pulseWebView.evaluateJavaScript("window.butler?.setBirthMode(null, false);", completionHandler: nil)
 
         case .questioning:
+            // BUG-L1 fix: startMicPulse() no longer forces micIndicatorView.isHidden = false.
+            // The timer runs so the animation is primed; visibility is exclusively controlled
+            // by syncUI via `micIndicatorView.isHidden = !isListening`. The mic dot therefore
+            // only appears once isListeningForAnswer becomes true in the coordinator.
             birthOrbView.isHidden = true
             pulseWebView.isHidden = false
             startMicPulse()
@@ -331,11 +408,25 @@ final class BirthPhaseViewController: NSViewController {
 
     // MARK: - PulseWebView update
 
-    private func updatePulseWebView(isSpeaking: Bool) {
-        guard lastSpeakingState != isSpeaking else { return }
-        lastSpeakingState = isSpeaking
-        let amplitude = isSpeaking ? 0.8 : 0.2
-        let state = isSpeaking ? "speaking" : "idle"
+    /// BUG-D1/M1/D2 fix: three-parameter version matches PRD state machine.
+    /// Priority order: thinking > speaking > listening > idle.
+    /// Uses `lastWebGLState` string guard to skip redundant JS evaluations.
+    private func updatePulseWebView(isSpeaking: Bool, isListening: Bool, isThinking: Bool) {
+        let state: String
+        let amplitude: Double
+
+        if isThinking {
+            state = "thinking"; amplitude = 0.3
+        } else if isSpeaking {
+            state = "speaking"; amplitude = 0.8
+        } else if isListening {
+            state = "listening"; amplitude = 0.5
+        } else {
+            state = "idle"; amplitude = 0.2
+        }
+
+        guard state != lastWebGLState else { return }
+        lastWebGLState = state
         pulseWebView.evaluateJavaScript(
             "window.butler?.setState('\(state)', \(amplitude));",
             completionHandler: nil
@@ -346,16 +437,21 @@ final class BirthPhaseViewController: NSViewController {
 
     private func startMicPulse() {
         guard micPulseTimer == nil else { return }
-        micIndicatorView.isHidden = false
-        micIndicatorView.alphaValue = 1.0
-        micPulseTimer = Timer.scheduledTimer(withTimeInterval: 0.6, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
+        // BUG-L1 fix: do NOT force micIndicatorView.isHidden = false here.
+        // Visibility is controlled exclusively by syncUI (micIndicatorView.isHidden = !isListening).
+        // This method only starts the animation timer.
+        // BUG-NEW-006 fix: add to .common run-loop mode so the pulse animation
+        // continues firing while NSTableView scroll tracking is active.
+        let t = Timer(timeInterval: 0.6, repeats: true) { [weak self] _ in
+            guard let self = self, !self.micIndicatorView.isHidden else { return }
             NSAnimationContext.runAnimationGroup { ctx in
                 ctx.duration = 0.3
                 self.micIndicatorView.animator().alphaValue =
                     self.micIndicatorView.alphaValue < 0.5 ? 1.0 : 0.3
             }
         }
+        RunLoop.main.add(t, forMode: .common)
+        micPulseTimer = t
     }
 
     private func stopMicPulse() {

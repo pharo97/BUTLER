@@ -143,6 +143,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         false
     }
 
+    // BUG-012 fix: cancel the birth observer task and stop the coordinator sequence
+    // on app quit so no in-flight async work touches deallocated state after the
+    // process begins tearing down its memory.
+    func applicationWillTerminate(_ notification: Notification) {
+        birthObserverTask?.cancel()
+        birthObserverTask = nil
+        birthCoordinator?.skip()
+        birthCoordinator = nil
+    }
+
     // MARK: - Glass Chamber
 
     private func showGlassChamber() {
@@ -219,8 +229,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let vc = BirthPhaseViewController(coordinator: coordinator, engine: engine)
         window.contentViewController = vc
 
+        // BUG-NEW-010 fix: do NOT call NSApp.activate(ignoringOtherApps: true).
+        // The .nonactivatingPanel mask + becomesKeyOnlyIfNeeded = true already handle
+        // window appearance without stealing focus from the user's current app —
+        // which is BUTLER's core non-negotiable of never interrupting.
         window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
         self.birthPhaseWindow = window
         observeBirthCompletion(coordinator: coordinator)
     }
@@ -258,7 +271,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // so we hop back to @MainActor via Task before touching actor-isolated state.
         let window = birthPhaseWindow
         NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.5
+            ctx.duration = 0.6   // BUG-H1 fix: PRD specifies 0.6s fade, was 0.5s
             window?.animator().alphaValue = 0
         } completionHandler: { [weak self] in
             Task { @MainActor [weak self] in
