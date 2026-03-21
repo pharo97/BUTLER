@@ -205,12 +205,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         window.level                     = .floating
         window.isOpaque                  = false
-        window.backgroundColor           = .black
+        window.backgroundColor           = .clear
         window.hasShadow                 = true
         window.isReleasedWhenClosed      = false
         window.collectionBehavior        = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         window.isMovableByWindowBackground = true
-        window.contentView               = NSHostingView(rootView: birthView)
+
+        let hostingView = NSHostingView(rootView: birthView)
+        hostingView.wantsLayer = true
+        hostingView.layer?.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 0)
+        window.contentView = hostingView
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         self.birthPhaseWindow = window

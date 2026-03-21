@@ -68,7 +68,21 @@ struct BirthPhaseView: View {
 
     var body: some View {
         ZStack {
-            Color.black.ignoresSafeArea()
+            // Glass background — matches GlassChamberView exactly
+            RoundedRectangle(cornerRadius: 24)
+                .fill(.ultraThinMaterial)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 24)
+                        .strokeBorder(
+                            LinearGradient(
+                                colors:     [.white.opacity(0.22), .white.opacity(0.04)],
+                                startPoint: .topLeading,
+                                endPoint:   .bottomTrailing
+                            ),
+                            lineWidth: 0.5
+                        )
+                }
+                .ignoresSafeArea()
 
             VStack(spacing: 0) {
                 Spacer(minLength: 40)
